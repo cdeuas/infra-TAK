@@ -154,6 +154,69 @@ This happened because the `oninput` handler was pushing every partial value dire
 
 **Commits:** `d23f96e`
 
+---
+
+# Part 3 — External / Managed Database Deployment Mode
+
+## New: AWS RDS, Azure, and Cloud SQL Support
+
+TAK Server can now be deployed against an **externally-hosted PostgreSQL** instance — AWS RDS, Azure Database for PostgreSQL, Google Cloud SQL, or any network-reachable PostgreSQL 15 server. This is a third deployment option alongside the existing Single Server and Split Two-Server modes.
+
+**How it works:**
+- infra-TAK installs the full `takserver_X.X_all.deb` package on the TAK Server VM
+- TAK Server's built-in SchemaManager creates all tables in the remote `cot` database on first boot — no manual schema scripts
+- infra-TAK patches `CoreConfig.xml` with the remote JDBC endpoint and credentials
+- Guard Dog monitors the external endpoint via TCP and `pg_isready` — no SSH to a managed DB server; alerts direct you to the cloud console instead
+
+**UI (TAK Server → Deploy TAK Server):**
+- New **External / Managed DB** radio button (third option)
+- Fields: DB Endpoint, Port, Database Name, Username, Password
+- **Test Connection** button — runs TCP, `pg_isready`, and psql auth checks from the TAK Server VM before deploy
+- Upload hint updates automatically for the correct `.deb` package (`takserver_X.X_all.deb`, same as One Server)
+
+**Guard Dog:**
+- Alert emails for managed DB failures include cloud console guidance instead of SSH restart commands
+- TCP-only monitoring (no SSH key required for external DB mode)
+
+See `docs/EXTERNAL-DB-SETUP.md` for full pre-flight SQL, network/firewall steps, and PostgreSQL parameter tuning for each cloud provider.
+
+**Commits:** `ba2f269`
+
+| File | Change |
+|------|--------|
+| `app.py` | `_tak_deployment_defaults` external_db block; `deploy_takserver` external_db flag; JDBC patch for external_db; `POST /api/takserver/external-db/test-connection` route; Guard Dog sync for external DB |
+| `static/takserver.js` | Third radio button, external-db-config-panel, `saveExternalDbConfig`, `testExternalDbConnection`, all mode-aware helpers updated |
+| `scripts/guarddog/tak-remotedb-watch.sh` | `EXTERNAL_DB_PLACEHOLDER`; contextual alert body for managed vs two-server |
+| `docs/EXTERNAL-DB-SETUP.md` | New — full setup guide for RDS/Azure/Cloud SQL |
+
+---
+
+# Part 4 — Certificate Auto-Renewal Display Fixes
+
+## Cert Expiry Card: No More False Alarms
+
+The Caddy / TAK Server certificate expiry display was previously turning orange at 40 days remaining — well before any renewal was needed, creating unnecessary alerts.
+
+**How renewal actually works:**
+1. Caddy auto-renews the Let's Encrypt cert at ~30 days remaining
+2. The `takserver-cert-renewal` systemd timer (monthly) runs `/opt/tak/renew-letsencrypt.sh` at ≤35 days — it reloads Caddy (triggering renewal), waits, then rebuilds the TAK JKS keystore from the fresh cert and restarts TAK Server
+3. Both the Caddy cert and the JKS are the **same cert**, rebuilt in the same script run — same expiry date
+
+**Old behavior:** UI turned yellow/orange at 40 days (before renewal), red at 14 days  
+**New behavior:** Green at ≥30 days (renewal hasn't needed to fire), **red at <30 days** (renewal ran and failed — action required). No yellow/orange intermediate state.
+
+**Guard Dog alert threshold** also corrected: was ≤40 days (fires before renewal runs), now ≤25 days (fires only if renewal already had its chance and failed).
+
+**Commits:** `087df32`, `3b787fe`, `482b004`, `19f048e`
+
+| File | Change |
+|------|--------|
+| `app.py` | `_caddy_cert_days_color`: green ≥30d, red <30d (removed yellow); renewal script `RENEW_WINDOW_DAYS` 40→35 |
+| `scripts/guarddog/tak-cert-watch.sh` | Alert threshold 40→25 days |
+| `docs/GUARDDOG.md` | Clarified cert renewal chain and alert thresholds |
+
+---
+
 ## Files Changed (Node-RED / Configurator)
 
 | File | Change |
