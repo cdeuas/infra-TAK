@@ -17,7 +17,11 @@ CRITICAL INCIDENTS:
 
 NEVER restart the LDAP outpost in a migration unless it is provably broken. NEVER use fewer than 4 Authentik web workers on an active install. NEVER set idle_in_transaction_session_timeout below 30s — Authentik startup will crash-loop. Caddy is a request shaper for the LDAP outpost — direct routing to authentik-server-1:9000 exposes the upstream Authentik 2026.2.2 LDAP-flow regression.
 
-See "April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal" and "April 2026 — v0.8.5 hardening" sections for full incident details and rules.
+VALIDATED in field on 2026-04-29 across tak-10 (heavy DataSync/Node-RED), ssdnodes (medium streaming), and responder (medium-light): all three on v0.8.5-alpha, all three on FQDN routing, all three with GUNICORN_CMD_ARGS=--timeout=120, all three at SIGABRT=0 / outpost recursion=0 / Postgres idle-in-trans=0 over 30+ min of real bind load (1.5–2.4 binds/sec sustained per box). Spiral monitor heartbeating every 10 min on each box, hitting "outpost already on FQDN — skipping (already correct)" gate as expected. v0.8.5 is the stable baseline.
+
+Bursty CPU on heavy-DataSync boxes is NORMAL, not a regression: tak-10 swings server CPU 100%+ → 7% → 1% over 60s windows because DataSync clients re-authenticate per HTTP request and Node-RED engine flows fire clock-aligned bind clusters. The `--timeout=120` gunicorn fix absorbs these bursts; SIGABRT count = 0 is the proof. Don't chase low CPU as a goal on Mission API / DataSync / Node-RED boxes.
+
+See "April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal", "April 2026 — v0.8.5 hardening", and "April 2026 — v0.8.5 fleet validation" sections for full incident details and rules.
 Use docs/HANDOFF-LDAP-AUTHENTIK.md as the single source of truth for what's done and what to do next.
 ```
 
@@ -245,6 +249,101 @@ sudo journalctl -u takwerx-console --since "1 hour ago" | grep -E "spiral monito
 - **NEVER restart Authentik with the upstream-default 30s gunicorn timeout on heavy-LDAP-load boxes.** Authentik 2026.2.2's flow planner exceeds 30s under sustained 3+ binds/sec, gunicorn SIGABRTs the worker, in-flight connections drop, Caddy returns 502, outpost retries, recursion. The `_ensure_authentik_gunicorn_timeout` migration sets `--timeout=120` automatically; never lower it below 90s. Operator override of `GUNICORN_CMD_ARGS` is allowed (the migration won't overwrite) but values <90s on a TAK-installed box are a known regression.
 - **Server-only restart is safe; full-stack restart is not.** When applying any Authentik server config change (workers, gunicorn timeout, env vars), use `docker compose up -d --no-deps --force-recreate server` — never `docker compose restart` (which restarts ldap and clears bind caches). The server-only path takes ~10-30s of API unavailability with cached LDAP service-account sessions surviving; the full-stack path triggers the v0.8.0 thundering herd.
 - **One-shot config migrations must not be wired into periodic monitors.** Things like `_ensure_authentik_gunicorn_timeout` apply once and then hand control to the operator. If a monitor re-applies them every 10 min, an operator override can never stick. Routing repairs are different — they're hot fixes for runtime drift and should re-run as needed.
+
+---
+
+## April 2026 — v0.8.5 fleet validation (post-release verification)
+
+**Date:** 2026-04-29 (within hours of v0.8.5-alpha tag on main).
+
+**Three-box matrix.** Validation snapshot taken after Update Now on all three production boxes (responder + ssdnodes via Update Now; tak-10 via the dev-branch one-shot Python invocation that pre-dated the tag).
+
+| Metric | tak-10 | ssdnodes | responder |
+|---|---|---|---|
+| infra-TAK version | 0.8.5-alpha | 0.8.5-alpha | 0.8.5-alpha |
+| LDAP routing | `https://tak.test12.taktical.net` | `https://tak.test8.taktical.net` | `https://tak.test6.takwerx.com` |
+| Gunicorn timeout | `--timeout=120` | `--timeout=120` | `--timeout=120` |
+| Postgres idle-in-trans | 0 | 0 | 0 |
+| Server SIGABRT (last 30 min) | 0 | 0 | 0 |
+| Outpost recursion / 502 / nil-pointer (last 30 min) | 0 | 0 | 0 |
+| Bind volume (last 5 min) | 706 (~2.4/sec) | 464 (~1.5/sec) | 473 (~1.6/sec) |
+| Server CPU (1s snapshot) | 104% (burst) → 7% → 1% over 60s | 10% | 1.8% |
+| Postgres CPU (1s snapshot) | 51% (burst) → 2% → 0.3% over 60s | 1.9% | 0.2% |
+| Server mem | 575 MiB stable | 401 MiB | 692 MiB |
+| Spiral monitor cadence | every 10 min, "already on FQDN — skipping" | every 10 min, same | every 10 min, same |
+| `authentik_gunicorn_timeout_migration` | success @ ts 1777481628 | success @ ts 1777485606 | success @ ts 1777485595 |
+| `authentik_proactive_routing_migration` | (not recorded — already on FQDN) | (not recorded — already on FQDN) | (not recorded — already on FQDN) |
+| `authentik_spiral_last_repair` | (not recorded — never spiraled) | (not recorded — never spiraled) | (not recorded — never spiraled) |
+
+**Interpretation rules established by this validation:**
+
+- **`*_migration: (not recorded)` is a SUCCESS signal, not a gap.** The migration functions only persist a `success` record on an *actual* migration. When the box is already in the desired state (FQDN routing already configured, GUNICORN_CMD_ARGS already set), the function hits its idempotent skip gate and returns without writing. Reading "not recorded" on a healthy box means "no work needed at this trigger" — confirmed via the per-tick `[spiral monitor] proactive routing: outpost already on FQDN — skipping (already correct)` journalctl line. (The `gunicorn_timeout_migration` IS recorded on all three because all three crossed the gate from "no env var" → "env var added" exactly once. The `proactive_routing_migration` is NOT recorded on any of them because all three were on FQDN before v0.8.5 even shipped — tak-10 from earlier-version routing, responder from the manual fix, ssdnodes from always being correct.)
+
+- **Update Now triggers the migrations within seconds.** ssdnodes and responder fired their gunicorn timeout migrations 11 seconds apart (`1777485595` vs `1777485606`), matching the user clicking Update Now on both boxes back-to-back. The post-update migration block correctly runs the new `_ensure_authentik_gunicorn_timeout` after the proactive routing function, even though the routing function found "already correct" and short-circuited.
+
+- **Bursty CPU on heavy-DataSync boxes is the EXPECTED healthy steady state**, not a regression. tak-10's server CPU swung 104% → 17% → 7% → 1% over 90 s; postgres swung 51% → 33% → 2% → 0.3%. Memory locked at 575 MiB (no leak). PIDs locked at 39 (no worker thrashing). Block I/O frozen at 283 MB write (no disk pressure). The pattern is: idle ... idle ... clock-aligned DataSync poll + ArcGIS engine refresh + Mission API client fires → cluster of 50+ binds in 1-2 sec → Authentik flow planner crunches → server CPU spikes → drops. With `--timeout=120` the bursts complete cleanly; without it they would have been the SIGABRT cascade we just fixed. **Cardinal rule: do NOT chase low CPU on Mission API / DataSync / Node-RED boxes. Burst-and-idle is the design target. The metric that matters is SIGABRT count over 30+ min — that should be 0.**
+
+- **Spiral monitor "already correct — skipping" tick every 10 min is the healthy fleet signature.** Each box shows exactly one heartbeat per 10 min from a single PID (single-instance lock holding). If you see two PIDs on one box's `[spiral monitor]` lines, the lock is broken (file a bug). If you see no heartbeats for >15 min, the monitor died (also a bug). Six consecutive `already on FQDN` ticks across an hour is the steady state.
+
+**Field test artifacts:** the diagnostic block `infra-TAK v0.8.5 cross-box metric snapshot` (in agent-transcripts) captures all the queries used. Re-run on any box to validate the same matrix.
+
+---
+
+## Fresh-deploy expectations (Azure / new boxes)
+
+For deploying v0.8.5-alpha onto a brand-new VPS (Azure, ssdnodes, etc.) the migrations fire automatically at the right points. Operator never has to call them manually.
+
+**Recommended deploy order (matches what the migrations are gated on):**
+
+1. **Caddy first** — set FQDN, save Domains. This makes `https://<fqdn>/-/health/live/` reachable later, which is precondition #4 for the proactive routing migration.
+2. **Authentik** — `Authentik → Deploy`. At deploy completion, two migrations fire:
+   - `_ensure_authentik_ldap_outpost_on_fqdn` — checks if `/opt/tak` exists; if NOT (likely on a fresh box at this point), logs "TAK Server not installed — leaving outpost on internal routing (light-load profile)" and exits. Internal routing is fine for console-only / pre-TAK boxes.
+   - `_ensure_authentik_gunicorn_timeout` — fires unconditionally (it's safe everywhere). Adds `GUNICORN_CMD_ARGS=--timeout=120` to `~/authentik/.env`, recreates the server container only.
+3. **TAK Server** — `TAK Server → Deploy`. At deploy completion, the SAME two migrations re-fire:
+   - `_ensure_authentik_ldap_outpost_on_fqdn` — now `/opt/tak` exists, all 5 preconditions are met → migrates outpost to FQDN routing. This is the canonical path on a fresh deploy.
+   - `_ensure_authentik_gunicorn_timeout` — already set from step 2, so no-op skip ("GUNICORN_CMD_ARGS already set in .env — skipping (idempotent)"). One log line.
+4. **Spiral monitor** starts at console boot via the module-load thread. Heartbeats every 10 min, runs proactive routing pass first, reactive spiral pass second. On a fresh healthy box it sits silently except for the heartbeat.
+
+**Post-deploy verification block (run once after step 3):**
+
+```bash
+# 1. Version
+grep '^VERSION' ~/infra-TAK/app.py
+
+# 2. Routing — should be FQDN
+grep AUTHENTIK_HOST ~/authentik/docker-compose.yml | grep -A0 ldap -B0
+# Expected: AUTHENTIK_HOST: https://<your-fqdn>
+
+# 3. Gunicorn timeout — should be 120
+docker exec authentik-server-1 printenv GUNICORN_CMD_ARGS
+# Expected: --timeout=120
+
+# 4. Health signals — all zero
+docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc \
+  "SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction' AND application_name LIKE '%authentik%';"
+docker logs authentik-server-1 --since 10m 2>&1 | grep -cE "WORKER TIMEOUT|SIGABRT"
+docker logs authentik-ldap-1 --since 10m 2>&1 | grep -cE "exceeded stage recursion|502 bad gateway|nil pointer"
+
+# 5. Migrations recorded
+python3 -c "
+import json
+s = json.load(open('/root/infra-TAK/.config/settings.json'))
+for k in ['authentik_proactive_routing_migration', 'authentik_gunicorn_timeout_migration']:
+    print(f'{k}: {s.get(k) or \"(not recorded)\"}')"
+# Expected on a fresh TAK-installed deploy:
+#   authentik_proactive_routing_migration: { ts, outcome:success, fqdn:<fqdn> }   ← recorded once on TAK Server deploy completion
+#   authentik_gunicorn_timeout_migration:  { ts, outcome:success, value:120 }     ← recorded once on Authentik deploy completion
+
+# 6. Spiral monitor alive
+sudo journalctl -u takwerx-console --since "15 min ago" | grep "spiral monitor"
+# Expected: at least one "[spiral monitor] PID <N> acquired monitor lock — starting" line
+```
+
+**Azure-specific notes:**
+
+- Azure VMs sometimes hit DNS propagation delays for new FQDNs. The proactive routing migration probes `https://<fqdn>/-/health/live/` from inside the LDAP container; if Caddy hasn't finished fetching its LE cert OR DNS isn't fully propagated, the probe fails and the migration logs "cannot reach https://<fqdn> from LDAP container — skipping (Caddy/DNS not ready; retry later)" and exits cleanly. The spiral monitor will retry every 10 min until preconditions are met. **No manual action needed; just wait for the next monitor tick after DNS+Caddy are confirmed working.**
+- Azure NSG / firewall must allow inbound 443 (Caddy LE), 8089 (TAK Server CoT TLS), 8443 (TAK Portal HTTPS), 8446 (TAK Server cert enrollment), 5001 (infra-TAK console — restrict to your IP), 389/636 (LDAP outpost — restrict to localhost / TAK-Server-only).
+- If you provisioned the VM with a small instance type, watch memory: Authentik server is ~700 MiB after warm-up, postgres ~200 MiB, LDAP outpost ~15 MiB, plus the rest of the stack. Below 4 GB total RAM, you may OOM under bind storms. 8 GB is comfortable, 16+ GB is generous.
 
 ---
 
