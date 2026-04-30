@@ -90,7 +90,17 @@ Currently shows aggregate CPU %. On DataSync/Node-RED boxes the aggregate can lo
 
 Confirmed fix is in v0.8.6 (the `elif needs_pg_update:` scope bug was the root cause, not poll timing). But if there are still edge cases where the API poll starts before postgres is healthy on very slow disk (< 100 MB/s), a health-gate loop before the poll adds 0-5s on fast boxes and prevents edge-case races. Low risk, low effort.
 
-### 2c. NSG ARM template — integrate into `start.sh` advisory
+### 2c. Speed test: restore read MB/s display
+
+The manual disk speed test computes both read and write (`disk_speed_test_read_mbs` and `disk_speed_test_write_mbs`) but the current display only shows write. Read was accidentally dropped when the disk lines were rewritten in v0.8.6. Guard Dog is write-only by design (`dd oflag=dsync`), so the Guard Dog line stays write-only. The speed test line should show both:
+
+```
+Disk speed test (256 MiB):  210 MB/s write  /  1331 MB/s read
+```
+
+Low priority — data is still collected, just not rendered.
+
+### 2d. NSG ARM template — integrate into `start.sh` advisory
 
 `docs/azure-nsg-infra-tak.json` exists but is not linked from `start.sh` output. When `start.sh` detects an Azure environment (public IP ≠ private IP), it could print a one-line advisory:
 ```
