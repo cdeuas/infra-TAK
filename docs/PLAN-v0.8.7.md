@@ -1,188 +1,215 @@
 # v0.8.7-alpha — Work Plan
 
-**Headline feature: Rollback**
+**Headline (and ONLY) feature: Authentik stability — periodic auto-restart**
 
-The ability to revert to the previous working version of infra-TAK from the console, without SSH. This is the single most-requested operator safety net and the main focus of v0.8.7.
+Make Authentik *quiet* so the operator doesn't have to think about it. v0.8.5 fixed the acute crashes. v0.8.6 fixed the Azure deploy bugs. **v0.8.7 fixes the chronic CPU-pinning that makes the box feel broken even when nothing is technically wrong.**
+
+> **Scope discipline note (Apr 30 2026):** Earlier drafts had rollback as the v0.8.7 headline. **Rollback has been moved to v0.8.8** — operator stability comes first. Authentik must be silent, predictable, and self-healing before we add new operator features. v0.8.7 is Authentik. v0.8.8 is rollback. No mixing.
 
 ---
 
-## 1. Rollback (main feature)
+## 1. Periodic Authentik server+worker auto-restart (the main feature)
 
 ### Problem
 
-Today's Update Now is one-directional. It runs `git fetch && git checkout --force origin/main` and restarts the console. If the new version has a regression (bad Authentik deploy, broken UI, startup crash), the operator has no recovery path from the console — they must SSH in, find the previous commit hash, and manually `git checkout <hash>` + restart. Non-technical operators on production boxes cannot do this, and experienced operators shouldn't have to.
+After ~5h of heavy LDAP load on a DataSync/Node-RED box, Authentik's server + postgres CPU pin at sustained 99% / 93% even with **lower** bind volume than baseline (489/5min) and a 96% bind cache hit rate. Bind work is fine. Internal Authentik runtime state has drifted — likely memory growth, query plan cache fragmentation, session tracker drift, or accumulated event-trigger handler state. Symptoms operators see:
 
-The same issue applies after configuration changes (e.g. someone clicked Save on a Caddy block and broke TLS, or a TAK Server reconfigure pushed a bad CoreConfig.xml). Those aren't code-rollback scenarios but they point to the same gap: **no in-console undo for consequential actions**.
+- Slow Node-RED UI (Authentik proxy is the bottleneck, not Node-RED).
+- DataSync / Tablet Command WebSocket flows go quiet (cold proxy session, silent reconnect failure).
+- Console feels sluggish when navigating Authentik-protected pages.
+- Occasional SIGABRTs and outpost recursion errors when individual flows hit the Gunicorn 120s timeout.
+
+The spiral monitor (v0.8.5) doesn't fire because there's no spiral signature — no `idle in transaction` flood, no spiral-specific markers in outpost logs. The system is *functional*, just **expensive and unresponsive**.
+
+### Field evidence (tak-10, Apr 30 2026)
+
+A simple `docker compose up -d --no-deps --force-recreate server worker`:
+
+| Metric | Before recreate | After recreate (5-min soak, 60 samples) |
+|---|---|---|
+| server p50 CPU | **113.5%** (pinned) | **~24%** (bursty) |
+| postgres p50 CPU | **107.7%** (pinned) | **~24%** (bursty) |
+| SIGABRT count | 2 in 30 min | **0 in 5 min** |
+| Outpost spiral markers | 4 in 30 min | **0 in 5 min** |
+| Task creation rate | 415 / 5 min | **237 / 5 min** |
+
+Postgres dropped ~5× immediately. Server flipped from "always on" to responder-style "burst then idle". **Zero LDAP impact** (outpost stayed up, cached SA bind survived, ~30s API blip during recreate).
 
 ### Design goals
 
-1. **One-click rollback from the console** — clearly labeled "Rollback to v0.8.x-alpha" button that undoes the last update.
-2. **Before any update, snapshot the current state** — at minimum the current git commit hash, so rollback always knows where to go back to.
-3. **Safe and idempotent** — rollback runs the same start-up path as a normal install (no special teardown). Services end up in the same state as a clean install of the previous version.
-4. **Minimal footprint** — store the rollback snapshot in `settings.json` (already used for migration forensics). No new daemon, no new files except optionally a lightweight pre-update config dump.
+1. **Automatic.** Operator sets it once (or accepts the default), and tak-10-class boxes never accumulate enough state drift to be felt.
+2. **Safe by construction.** Skip if a spiral is currently active (let the spiral monitor own that path). Skip if the box was just deployed/updated (no double restart). Skip if a deploy is in progress.
+3. **Off-peak.** Schedule the recreate at a quiet local hour (default 04:00). Configurable.
+4. **Honest UX.** Show the operator: "Last Authentik server restart: 3 days ago. Next scheduled: in 4 days at 04:00." So nothing happens behind their back.
+5. **Manual override.** "Restart Authentik server now" button for on-demand triggering when an operator notices slowness.
+6. **No LDAP downtime.** Only `server` and `worker` containers are recreated — `ldap`, `postgresql`, `redis` stay up.
 
-### Proposed implementation
+### Implementation
 
-#### Phase 1 — Code rollback (MVP)
+#### Settings (in `settings.json`)
 
-**Pre-update snapshot (in `_run_update_now()`):**
-Before `git fetch + force-checkout`, record the current state in `settings.json`:
 ```json
 {
-  "rollback_snapshot": {
-    "ts": 1777500000,
-    "version": "0.8.6-alpha",
-    "git_commit": "abc1234",
-    "git_branch": "main"
+  "authentik_periodic_restart": {
+    "enabled": true,
+    "interval_hours": 168,
+    "window_hour_local": 4,
+    "last_run_ts": 0,
+    "last_run_outcome": "ok",
+    "last_run_duration_s": 0,
+    "last_run_evidence": {
+      "before": { "server_cpu_p50": 113.5, "postgres_cpu_p50": 107.7 },
+      "after":  { "server_cpu_p50": 24.0,  "postgres_cpu_p50": 24.0 }
+    }
   }
 }
 ```
 
-**Rollback function (`_run_rollback()`):**
-1. Read `settings.json → rollback_snapshot`.
-2. If no snapshot or snapshot is the current commit → surface "No rollback available" message.
-3. Run `git checkout <git_commit> -- .` (checkout specific commit, not a branch).
-4. Restart the console service (same as Update Now finish).
-5. Clear the snapshot after rollback (avoid rollback-of-rollback confusion).
+#### Scheduler thread (`_authentik_periodic_restart_monitor`)
 
-**Console UI:**
-- Under "Update Now" button: small secondary button "Rollback to v0.8.6-alpha" (only visible if a snapshot exists and differs from current version).
-- Confirmation modal: "This will revert infra-TAK to v0.8.6-alpha (commit abc1234). Continue?"
-- Progress feedback identical to Update Now.
+A background daemon thread, started at module load (alongside `_authentik_spiral_monitor`):
 
-#### Phase 2 — Config backup/restore (stretch goal for v0.8.7 or defer to v0.8.8)
+1. Loop every 10 minutes.
+2. Read settings → check if `enabled`. If not, sleep.
+3. Compute `now_local_hour` and `hours_since_last_run`.
+4. Gate checks (all must pass):
+   - `hours_since_last_run >= interval_hours`
+   - `now_local_hour == window_hour_local` (within a 1h window)
+   - `_detect_authentik_ldap_spiral()` returns `False` (don't restart during a spiral)
+   - No deploy/update lockfile present
+   - Authentik server container has been up for >= 1 hour (don't restart something that just started)
+5. If all gates pass, run `_authentik_perform_recreate(plog)`:
+   - Sample server + postgres CPU p50 over 30 seconds (the "before").
+   - `cd ~/authentik && docker compose up -d --no-deps --force-recreate server worker`.
+   - Wait up to 90s for both containers to report `health: starting` → `healthy`.
+   - Sample server + postgres CPU p50 over 30 seconds (the "after").
+   - Persist outcome to `settings.json`.
+6. Log every gate decision to `~/infra-TAK/log/authentik-restart.log` so operators can see what's happening even when nothing fires.
 
-Before a TAK Server deploy or Authentik reconfigure, snapshot key config files:
-- `~/authentik/.env`
-- `~/authentik/docker-compose.yml`
-- `/opt/tak/CoreConfig.xml`
-- `/opt/tak/UserAuthenticationFile.xml`
+#### Console UI
 
-Store as timestamped tarballs in `/root/infra-TAK/.backups/`. Expose "Restore last config" button if a backup exists newer than the current config file mtime. This covers the "bad Save" scenario without needing a full code rollback.
+Single small section under the Authentik status block:
 
-### Scope / boundaries for v0.8.7
+```
+Authentik server health
+  Last restart: 3 days ago (auto, p50 CPU 113% → 24%)
+  Next scheduled: in 4 days at 04:00 local
+  [ Restart Authentik server now ]   [ Disable auto-restart ]
+```
 
-- Phase 1 (code rollback) is the v0.8.7 deliverable.
-- Phase 2 (config backup/restore) is a stretch goal — design it so Phase 1 doesn't block it.
-- Rollback does NOT re-run migrations or undeploy Authentik — it only reverts the `app.py` code. If the bad version touched `~/authentik/docker-compose.yml`, the operator may still need a manual fix. Document this limitation clearly in the UI.
-- No rollback chain (rollback of rollback). One level deep. Simple and safe.
+The "Restart Authentik server now" button:
+- Confirmation modal: "This will recreate `authentik-server-1` and `authentik-worker-1`. LDAP, postgres, and the LDAP outpost are NOT affected. Estimated outage: 30s of API requests. Continue?"
+- Streams progress identical to other one-shot operations.
+
+The "Disable auto-restart" toggle flips `authentik_periodic_restart.enabled` to false. (Operators on small boxes that don't need it can opt out.)
+
+### Hooks
+
+- Start the monitor thread at module load (line ~end of file, alongside spiral monitor).
+- Hook `_authentik_perform_recreate` into:
+  - The new console button (manual trigger).
+  - The scheduler thread (automatic trigger).
+  - Post-update migration (if a v0.8.7-introduced setting needs the recreate to take effect — likely not, but the hook is cheap).
+
+### Default settings on fresh deploy
+
+```json
+{
+  "enabled": true,
+  "interval_hours": 168,
+  "window_hour_local": 4
+}
+```
+
+Weekly at 04:00 local. Conservative default. Operators with very heavy load can drop to 72h. Operators with very light load can disable.
 
 ### Risks and mitigations
 
 | Risk | Mitigation |
 |------|-----------|
-| git detached-HEAD confusion | After rollback, branch is detached at the commit. "Update Now" re-attaches to `origin/main`. Document this. |
-| Snapshot gets stale (multiple updates without rollback use) | Overwrite snapshot on every update. Only one level of rollback supported. |
-| Console restart mid-rollback | Same risk as Update Now. systemd restarts the service automatically. Rollback is idempotent. |
-| Version banner shows wrong version in detached state | Read `VERSION` from `app.py` after checkout, not from git. Already how it works. |
+| Restart fires during an unnoticed active LDAP burst → brief outage felt by users | The 30s API blip is not enough to break LDAP sessions (cached SA bind survives). Outpost continues serving cached binds. Worst case: a single user re-auth. |
+| Container fails to come back up after recreate (image pull issue, volume problem) | Health check loop in `_authentik_perform_recreate` waits 90s and reports failure to settings.json. Operator sees "last_run_outcome: failed" in dashboard. Spiral monitor still runs as fallback. |
+| Operator on small/light box doesn't need this and finds the weekly blip annoying | "Disable auto-restart" toggle. Off-peak window (04:00 default) minimizes likelihood of being noticed. |
+| Schedule races with `Update Now` (operator triggers update at 04:00) | Scheduler checks for deploy/update lockfile and skips. Update Now finishes its own restart anyway. |
+| Two scheduler threads created somehow (module reloaded twice) | PID-checked lockfile (same pattern as spiral monitor). Reused, not invented. |
+| Multiple boxes restart at exactly 04:00 across a fleet → support spike if something goes wrong | Fleet boxes are independent; no shared state. The window is 1 hour wide, so jitter naturally spreads them. Plus this is single-tenant per box anyway. |
 
 ---
 
-## 2. Minor / maintenance items (v0.8.7 scope TBD)
+## 2. Smaller Authentik-stability items (ride along)
 
-These are lower-priority and can ship alongside rollback or slip to v0.8.8 depending on complexity.
+These are scoped tightly. They ship alongside the auto-restart only if they don't slow down v0.8.7. Otherwise → v0.8.8 or v0.8.9.
 
-### 2a. Dashboard: CPU % per-core breakdown (stretch)
+### 2a. Node-RED: upstream-health-check pattern for WebSocket / mTLS flows
 
-Currently shows aggregate CPU %. On DataSync/Node-RED boxes the aggregate can look alarming (104%) while individual cores are fine. A per-core bar or sparkline would let operators distinguish "one core busy" from "all cores pegged". Low priority — burst-and-idle is already documented as expected.
+**Field evidence (tak-10, Apr 30 2026):** Tablet Command AVL feed showed no data after Node-RED container restart. Resolved when the operator logged into Node-RED through the Authentik proxy (warmed the upstream session). The flow itself was fine — its WebSocket connect had silently failed because the Authentik proxy session was cold while server CPU was pinned.
 
-### 2b. Authentik deploy: wait for all containers healthy before API poll
+**Once item 1 (auto-restart) is in place, this should disappear**, because Authentik server CPU won't be pinned long enough for proxy sessions to go cold during a deploy. But for defense in depth:
 
-Confirmed fix is in v0.8.6 (the `elif needs_pg_update:` scope bug was the root cause, not poll timing). But if there are still edge cases where the API poll starts before postgres is healthy on very slow disk (< 100 MB/s), a health-gate loop before the poll adds 0-5s on fast boxes and prevents edge-case races. Low risk, low effort.
+- Add a 60s upstream health-check inject pattern to `nodered/build-flows.js` for flows with persistent upstream connections (DataSync, Tablet Command, Mission API).
+- If health check fails, trigger a reconnect.
+- Document the pattern in `nodered/README.md`.
 
-### 2c. Speed test: restore read MB/s display
+Defer if it adds risk to the v0.8.7 ship. The auto-restart fix in item 1 is the upstream root cause, so item 2a is belt-and-suspenders.
 
-The manual disk speed test computes both read and write (`disk_speed_test_read_mbs` and `disk_speed_test_write_mbs`) but the current display only shows write. Read was accidentally dropped when the disk lines were rewritten in v0.8.6. Guard Dog is write-only by design (`dd oflag=dsync`), so the Guard Dog line stays write-only. The speed test line should show both:
+### 2b. TAK Server webadmin admin-role final verifier
 
-```
-Disk speed test (256 MiB):  210 MB/s write  /  1331 MB/s read
-```
-
-Low priority — data is still collected, just not rendered.
-
-### 2d. NSG ARM template — integrate into `start.sh` advisory
-
-`docs/azure-nsg-infra-tak.json` exists but is not linked from `start.sh` output. When `start.sh` detects an Azure environment (public IP ≠ private IP), it could print a one-line advisory:
-```
-Azure detected — ensure NSG allows: 443, 5001, 8089, 8443, 8446
-See docs/azure-nsg-infra-tak.json for the ARM template.
-```
-
-### 2e. Authentik server+worker periodic auto-restart on heavy-load boxes
-
-**Field evidence (tak-10, Apr 30 2026):** After ~5h of heavy LDAP load on a DataSync/Node-RED box, Authentik server + postgres CPU pinned at p50 99% / 93% even with bind volume 489/5min and 96% cache hit rate. **A simple `docker compose up -d --no-deps --force-recreate server worker` immediately dropped postgres p50 to ~30% and server to bursty pattern matching responder.** Confirms runtime state accumulation (memory growth, query plan cache fragmentation, or session tracker drift) in long-running Authentik server containers under sustained event-trigger load.
-
-**Proposed:** Weekly (or every 72h) auto-recreate of `authentik-server-1` + `authentik-worker-1`, scheduled off-peak (e.g. 04:00 local). LDAP outpost stays up so cached SA bind survives — no thundering herd, no LDAP downtime. ~15-30s API outage during recreate is acceptable in the maintenance window. Add a "Restart Authentik server now" button in the console for manual on-demand triggering.
-
-**Settings:**
-```json
-{
-  "authentik_periodic_restart_enabled": true,
-  "authentik_periodic_restart_interval_hours": 168,
-  "authentik_periodic_restart_window_hour_local": 4,
-  "authentik_periodic_restart_last_run": 0
-}
-```
-
-Detector logic: skip if `_detect_authentik_ldap_spiral` is currently firing (don't restart during an active spiral; let the spiral monitor handle it).
-
-### 2f. Node-RED: verify all flows fire on container restart / post-update
-
-**Operator concern (tak-10, Apr 30 2026):** Tablet Command AVL feed appeared not to be flowing data. Resolved itself once the operator logged into Node-RED — i.e. the act of accessing Node-RED through the Authentik proxy warmed the upstream session and the flow's WebSocket / mTLS connection re-established. **This confirms the flow itself is fine; the issue was an upstream dependency (Authentik proxy session) being slow/cold while Authentik server CPU was pinned (item 2e).** Once item 2e (periodic auto-restart) is in place, this symptom should disappear.
-
-**Audit checklist (still worth doing for resilience):**
-- ArcGIS engine tabs (dynamic, Configurator-driven): confirmed auto-fire after `nodered/deploy.sh` (context restore restores credentials and engine state).
-- TFR / TC / PulsePoint / KML feeds: same path — confirmed.
-- TAK Mission API (mTLS): inject node "fire on deploy" must be set; otherwise depends on first incoming event.
-- DataSync / Tablet Command flows: depend on TAK Server WebSocket being reachable on container start; if Authentik proxy was slow during restart, the WebSocket connect can fail silently and the flow waits idly until something pokes it. Add a `catch + 30s retry` pattern as a flow template.
+**Field evidence (tak-10, Apr 30 2026):** After "Resync LDAP webadmin", the TAK Server WebUI redirected webadmin to **WebTAK (operator UI)** instead of the **Admin Console**. A second "Resync LDAP webadmin" fixed it.
 
 **Proposed:**
-- Add a "Flow health check" Node-RED endpoint that reports per-tab connection status, scraped by the dashboard.
-- Document the "fire on deploy" inject-node pattern in `nodered/README.md`.
-- Add a CHANGELOG note in v0.8.7 explaining what auto-fires vs. what needs manual restart.
-- For flows with WebSocket / persistent connections (DataSync, Tablet Command, Mission API): add an upstream-health-check inject node that pings the upstream every 60s and triggers a reconnect if the connection has died silently.
-
-### 2g. TAK Server: webadmin admin-role assignment regression
-
-**Field evidence (tak-10, Apr 30 2026):** After webadmin password rotation / Authentik webadmin user re-creation (via "Resync LDAP webadmin"), the TAK Server WebUI redirected webadmin to **WebTAK (operator UI)** instead of the **Admin Console** — meaning TAK Server's `UserAuthenticationFile.xml` did not list the new webadmin user with the `admin` role. **Mitigation that worked:** running "Resync LDAP webadmin" again from the console resolved it. So the resync flow has the admin-role assignment, but the *first* run didn't fully complete the role propagation (or the role got dropped during a subsequent reconcile).
-
-**Suspect paths:**
-- `/opt/tak/UserAuthenticationFile.xml` — does the resync flow ALWAYS add `<userRole role="ADMIN"/>` for webadmin? Verify in `_ensure_authentik_webadmin` / TAK Server reconcile.
-- TAK Server's `setadmin.sh` or admin-cert sync — does it run on every webadmin resync or only on first deploy?
-- Race between webadmin user creation in Authentik and admin-role apply in TAK Server (LDAP cache / sync delay).
-
-**Proposed:**
-- Add a final verifier to "Resync LDAP webadmin" that confirms webadmin appears in `UserAuthenticationFile.xml` with `role="ADMIN"` before reporting success.
+- Add a final verifier to the resync flow that confirms webadmin appears in `/opt/tak/UserAuthenticationFile.xml` with `role="ADMIN"` before reporting success.
 - If missing, automatically run the admin-role apply step (idempotent).
-- Add a console button "Verify webadmin admin role" that runs the check on demand.
 - Log the verifier result to `settings.json → webadmin_admin_role_check`.
+
+Small diff (~30 lines). Safe to include.
+
+### 2c. Authentik deploy: wait for all containers healthy before API poll
+
+Confirmed root cause of v0.8.6's deploy-on-Azure issue was the `elif needs_pg_update:` scope bug, not poll timing. But on very slow disk (< 100 MB/s), a health-gate loop before the API poll adds 0-5s on fast boxes and prevents edge-case races. Low risk.
+
+Defer if it bloats the diff. Item 1 is the priority.
 
 ---
 
 ## 3. v0.8.7 acceptance criteria
 
-- [ ] "Rollback to v0.8.x-alpha" button appears in console after an update is applied.
-- [ ] Clicking rollback returns `app.py` to the previous version (verified by `grep '^VERSION'`).
-- [ ] Confirmation modal shows previous version string and commit hash.
-- [ ] After rollback, Update Now works normally and returns to current main.
-- [ ] If no snapshot exists, the rollback button is hidden (not just greyed out).
-- [ ] Snapshot survives a console restart (stored in `settings.json`, not in-memory).
-- [ ] Tested on Azure (tak-test-3) — rollback from a dummy v0.8.7 bump back to v0.8.6.
+- [ ] Periodic auto-restart fires once on tak-10 (force the schedule with a temporary `interval_hours: 0` to validate live).
+- [ ] Before/after CPU evidence persisted to `settings.json → authentik_periodic_restart.last_run_evidence` and visible in the dashboard.
+- [ ] LDAP outpost stays up across the entire restart window (zero outpost recursion markers in logs during the restart).
+- [ ] Manual "Restart Authentik server now" button works from console with no SSH required.
+- [ ] Schedule respects the `enabled: false` toggle (proven by setting it false and watching the monitor skip).
+- [ ] Schedule respects the spiral gate (artificially trigger spiral detection once and confirm restart is skipped that cycle).
+- [ ] Tested on at least two production boxes (tak-10 + ssdnodes) for a full week.
+- [ ] No LDAP incidents during the test week. Spiral monitor still firing every 10 min as before.
 
 ---
 
-## 4. Notes from v0.8.6 post-release
+## 4. Out of scope for v0.8.7 (moved to v0.8.8 or later)
+
+These were considered but moved out to keep this release focused on Authentik stability:
+
+- **Rollback feature** (one-click revert from console). → **v0.8.8 headline.** See `docs/PLAN-v0.8.8.md`.
+- **Dashboard CPU per-core breakdown.** → v0.8.9 or later.
+- **Speed test: read MB/s display.** → v0.8.9 or later (data still collected, just not rendered).
+- **NSG ARM template advisory in start.sh.** → v0.8.9 or later.
+
+---
+
+## 5. Why ship v0.8.7 fast as Authentik-stability-only
+
+Three reasons:
+
+1. **The chronic pain is the one driving the operator nuts.** v0.8.5 fixed the acute crashes, but tak-10 still goes into "expensive and sluggish" mode every few hours. That's the felt-it-every-day problem. Fix it first.
+
+2. **Auto-restart is the smallest possible change with the biggest possible win.** The mechanism is already field-validated (Apr 30 2026 on tak-10). It's ~150 lines of code: scheduler thread, recreate function, settings, one console button. Plus zero new dependencies. Plus rollback isn't a prerequisite for shipping it — the change is so isolated that even if it has an edge case, it's an in-place fix.
+
+3. **Rollback can wait one release.** If v0.8.7's auto-restart has a rough edge, the worst case is the operator runs the existing manual `force-recreate` command. They already know how. Rollback would be nice-to-have, but it's not blocking Authentik peace of mind.
+
+---
+
+## 6. Notes from v0.8.6 post-release (kept for context)
 
 - All four v0.8.6 fixes confirmed working on Azure tak-test-3 (D8as_v5, P10 64 GiB, ~145 MB/s).
-- v0.8.5 production fleet (tak-10, ssdnodes, responder) is stable at all-zeros health metrics.
-- No LDAP incidents since v0.8.5. Spiral monitor heartbeating silently every 10 min on all three boxes.
+- v0.8.5 production fleet (tak-10, ssdnodes, responder) is stable on acute health metrics (zero SIGABRT, zero recursion, zero idle-in-trans).
+- Apr 30 2026: discovered the v0.8.5 fix protects against the *acute* failure but not the *chronic* state-drift symptom on heavy-load boxes. v0.8.7 closes that gap.
 - v0.8.6 dev→main selective merge uses the pattern in `docs/COMMANDS.md`.
-- Rollback is the most immediately useful operator-safety feature. No need for complex Phase 2 to ship a useful v0.8.7.
-
-## 5. Apr 30 2026 — tak-10 field session findings
-
-Three issues surfaced during a tak-10 deep-dive after v0.8.6 was already shipped to main. None are v0.8.6 regressions; all are pre-existing or operational items now scoped into v0.8.7:
-
-1. **Authentik runtime state accumulation** (item 2e above) — `server+worker --force-recreate` cleared sustained 99%/93% CPU back to bursty pattern. Manual restart works; need automation.
-2. **Tablet Command flow appeared stalled on Node-RED** — resolved by operator logging into Node-RED through the Authentik proxy. Root cause: same as item 1 (Authentik server CPU saturated → proxy sessions cold → WebSocket connect failed silently → flow waited). Folded into item 2f as a flow-resilience hardening (upstream health check + reconnect). Auto-restart in 2e prevents recurrence.
-3. **TAK Server webadmin redirected to WebTAK instead of Admin Console** (item 2g above) — fixed by running "Resync LDAP webadmin" a second time. Investigate why one resync wasn't sufficient and add a final-state verifier.
