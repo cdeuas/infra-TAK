@@ -1,0 +1,26 @@
+version: 1
+metadata:
+  name: NetBird OIDC Provider
+entries:
+  - model: authentik_providers_oauth2.oauth2provider
+    identifiers:
+      name: NetBird
+    attrs:
+      client_id: "eb1c9a4d3f5b8e7c1a2d4f6e8b0c2a4d"
+      client_secret: "6e8b0c2a4d6f8e0a2c4e6b8d0a2c4e6f8a0c2e4f6a8b0d2e4f6a8b0c2d4e6f8a"
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      redirect_uris: 
+        - matching_mode: "strict"
+          url: "https://netbird.solvato.io/auth/callback"
+      property_mappings:
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, profile]]
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, email]]
+  - model: authentik_core.application
+    identifiers:
+      slug: netbird
+    attrs:
+      name: NetBird
+      provider: !Find [authentik_providers_oauth2.oauth2provider, [name, NetBird]]
+      icon_url: "https://raw.githubusercontent.com/netbirdio/netbird/main/infrastructure_files/netbird-logo-color.png"
