@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.8.8-alpha"
+VERSION = "0.8.5-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -583,7 +583,6 @@ NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
 # Authentik official brand icon (external URL)
 AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/main/web/icons/icon_left_brand.png"
-FRIGATE_LOGO_URL = "https://frigate.video/img/logo.png"
 # Caddy official logo for dark backgrounds — white text (Wikimedia Commons)
 CADDY_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/5/56/Caddyserver_logo_dark.svg"
 # TAK (Team Awareness Kit) official brand logo from tak.gov
@@ -764,14 +763,6 @@ def detect_modules():
                 nodered_running = True
     modules['nodered'] = {'name': 'Node-RED', 'installed': nodered_installed, 'running': nodered_running,
         'description': 'Flow-based automation & integrations', 'icon': '🔴', 'icon_url': NODERED_LOGO_URL_2, 'route': '/nodered', 'priority': 6}
-    # Frigate NVR
-    frigate_installed = os.path.exists(os.path.expanduser("~/frigate/docker-compose.yml"))
-    frigate_running = False
-    if frigate_installed:
-        r = subprocess.run('docker ps --filter name=frigate --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-        frigate_running = 'Up' in r.stdout
-    modules['frigate'] = {'name': 'Frigate NVR', 'installed': frigate_installed, 'running': frigate_running,
-        'description': 'AI-powered NVR with object detection', 'icon': 'videocam', 'icon_url': FRIGATE_LOGO_URL, 'route': '/frigate', 'priority': 6.5}
     # CloudTAK (local or remote deployment target)
     cloudtak_dir = os.path.expanduser('~/CloudTAK')
     cloudtak_cfg = _get_cloudtak_deployment_config(settings)
@@ -1138,25 +1129,6 @@ def _get_cpu_model_local():
     return None
 
 
-def _get_vcpu_count_local():
-    """Return number of vCPUs visible to the OS (nproc), or None."""
-    try:
-        import os as _os
-        n = _os.cpu_count()
-        if n:
-            return n
-    except Exception:
-        pass
-    try:
-        r = subprocess.run(['nproc'], capture_output=True, text=True, timeout=5)
-        v = r.stdout.strip()
-        if v.isdigit():
-            return int(v)
-    except Exception:
-        pass
-    return None
-
-
 def _get_cpu_model_remote(remote_cfg):
     """Return CPU model name on remote host via SSH, or None."""
     try:
@@ -1168,48 +1140,8 @@ def _get_cpu_model_remote(remote_cfg):
     return None
 
 
-def _get_vcpu_count_remote(remote_cfg):
-    """Return vCPU count on remote host via SSH, or None."""
-    try:
-        ok, out = _ssh_probe(remote_cfg, 'nproc 2>/dev/null', timeout=5)
-        if ok and out and out.strip().isdigit():
-            return int(out.strip())
-    except Exception:
-        pass
-    return None
-
-
-_GUARDDOG_DISKIO_CSV = '/var/lib/takguard/diskio_history.csv'
-
-
-def _read_guarddog_latest_write_mbs():
-    """Return the most recent sync write speed (MB/s) from Guard Dog's diskio_history.csv, or None."""
-    try:
-        if not os.path.exists(_GUARDDOG_DISKIO_CSV):
-            return None
-        last_val = None
-        with open(_GUARDDOG_DISKIO_CSV) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                parts = line.split(',')
-                if len(parts) >= 2:
-                    try:
-                        last_val = float(parts[1])
-                    except ValueError:
-                        pass
-        return last_val
-    except Exception:
-        return None
-
-
 def _get_disk_io_local():
-    """Return (read_mbs, write_mbs, source) from Guard Dog CSV (sync) or vmstat (cached). source is 'sync' or 'cached'."""
-    # Prefer Guard Dog CSV — already uses dd oflag=dsync, trustworthy
-    gd_write = _read_guarddog_latest_write_mbs()
-    if gd_write is not None:
-        return (None, gd_write, 'sync')
+    """Return (read_mbs, write_mbs) from vmstat 1 2 (1-second sample). Blocks are 512 bytes. None on failure."""
     try:
         r = subprocess.run(
             'vmstat 1 2 2>/dev/null | tail -1 | awk \'{print $9,$10}\'',
@@ -1221,33 +1153,19 @@ def _get_disk_io_local():
         if len(parts) < 2:
             return None
         bi, bo = int(parts[0]), int(parts[1])
-        # blocks/s, 512 bytes per block -> MB/s (buffer cache speed, not real disk throughput)
+        # blocks/s, 512 bytes per block -> MB/s
         read_mbs = round((bi * 512) / (1024 * 1024), 2)
         write_mbs = round((bo * 512) / (1024 * 1024), 2)
-        return (read_mbs, write_mbs, 'cached')
+        return (read_mbs, write_mbs)
     except Exception:
         return None
 
 
 def _get_disk_io_remote(remote_cfg):
-    """Return (read_mbs, write_mbs, source) on remote host. Prefers Guard Dog CSV (sync), falls back to vmstat (cached)."""
+    """Return (read_mbs, write_mbs) on remote host from vmstat 1 2, or None."""
     if not remote_cfg or not (remote_cfg.get('host') or '').strip():
         return None
     try:
-        # Try Guard Dog CSV first (sync, trustworthy)
-        ok_gd, out_gd = _ssh_probe(
-            remote_cfg,
-            f"tail -20 {_GUARDDOG_DISKIO_CSV} 2>/dev/null | grep -v '^#' | grep ',' | tail -1",
-            timeout=5
-        )
-        if ok_gd and out_gd and ',' in out_gd:
-            parts = out_gd.strip().split(',')
-            if len(parts) >= 2:
-                try:
-                    return (None, float(parts[1]), 'sync')
-                except ValueError:
-                    pass
-        # Fall back to vmstat (cached)
         ok, out = _ssh_probe(
             remote_cfg,
             "vmstat 1 2 2>/dev/null | tail -1 | awk '{print $9,$10}'",
@@ -1261,7 +1179,7 @@ def _get_disk_io_remote(remote_cfg):
         bi, bo = int(parts[0]), int(parts[1])
         read_mbs = round((bi * 512) / (1024 * 1024), 2)
         write_mbs = round((bo * 512) / (1024 * 1024), 2)
-        return (read_mbs, write_mbs, 'cached')
+        return (read_mbs, write_mbs)
     except Exception:
         return None
 
@@ -1301,8 +1219,7 @@ def _parse_dd_speed_mbs(stderr_or_stdout):
 
 
 def _run_disk_speed_test_local():
-    """Run 256 MiB sync write (oflag=dsync). Returns dict with disk_speed_test_write_mbs or disk_speed_test_error.
-    Uses oflag=dsync to match start.sh and Guard Dog — measures real hardware throughput, not buffer cache."""
+    """Run 256 MiB write then read. Returns dict with disk_speed_test_read_mbs/write_mbs or disk_speed_test_error."""
     path = _disk_speed_test_path()
     if not path:
         return {'disk_speed_test_error': 'no writable temp dir'}
@@ -1310,15 +1227,15 @@ def _run_disk_speed_test_local():
     try:
         rw = subprocess.run(
             [dd, 'if=/dev/zero', 'of=' + path,
-             'bs=1M', 'count=' + str(_DISK_SPEED_TEST_SIZE_MB), 'oflag=dsync'],
-            capture_output=True, text=True, timeout=120
+             'bs=1M', 'count=' + str(_DISK_SPEED_TEST_SIZE_MB), 'oflag=direct'],
+            capture_output=True, text=True, timeout=60
         )
         out_w = (rw.stdout or '') + (rw.stderr or '')
         write_mbs = _parse_dd_speed_mbs(out_w)
         if write_mbs is None and rw.returncode != 0:
             rw2 = subprocess.run(
                 [dd, 'if=/dev/zero', 'of=' + path, 'bs=1M', 'count=' + str(_DISK_SPEED_TEST_SIZE_MB)],
-                capture_output=True, text=True, timeout=120
+                capture_output=True, text=True, timeout=60
             )
             write_mbs = _parse_dd_speed_mbs((rw2.stdout or '') + (rw2.stderr or ''))
         if write_mbs is None:
@@ -1453,12 +1370,9 @@ def _top_processes_local():
         cpu_model = _get_cpu_model_local()
         if cpu_model:
             result['processor'] = cpu_model
-        vcpu = _get_vcpu_count_local()
-        if vcpu:
-            result['vcpu_count'] = vcpu
         disk_io = _get_disk_io_local()
         if disk_io is not None:
-            result['disk_io_read_mbs'], result['disk_io_write_mbs'], result['disk_io_source'] = disk_io
+            result['disk_io_read_mbs'], result['disk_io_write_mbs'] = disk_io
         result.update(_run_disk_speed_test_local())
         return result
     except Exception:
@@ -1498,12 +1412,9 @@ def _top_processes_remote(remote_cfg):
         cpu_model = _get_cpu_model_remote(remote_cfg)
         if cpu_model:
             result['processor'] = cpu_model
-        vcpu = _get_vcpu_count_remote(remote_cfg)
-        if vcpu:
-            result['vcpu_count'] = vcpu
         disk_io = _get_disk_io_remote(remote_cfg)
         if disk_io is not None:
-            result['disk_io_read_mbs'], result['disk_io_write_mbs'], result['disk_io_source'] = disk_io
+            result['disk_io_read_mbs'], result['disk_io_write_mbs'] = disk_io
         result.update(_run_disk_speed_test_remote(remote_cfg))
         return result
     except Exception as e:
@@ -19773,8 +19684,6 @@ async function doUninstallPortal(){
 
 # Authentik module
 authentik_deploy_log = []
-frigate_deploy_log = []
-frigate_deploy_status = {"running": False, "complete": False, "error": False}
 authentik_deploy_status = {'running': False, 'complete': False, 'error': False}
 
 @app.route('/authentik')
@@ -20392,7 +20301,7 @@ entries:
     state: present
     id: ldap-authentication-login
   - attrs:
-      evaluate_on_plan: false
+      evaluate_on_plan: true
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -20404,7 +20313,7 @@ entries:
     state: present
     id: ldap-identification-stage-flow-binding
   - attrs:
-      evaluate_on_plan: false
+      evaluate_on_plan: true
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -20416,7 +20325,7 @@ entries:
     state: present
     id: ldap-authentication-password-binding
   - attrs:
-      evaluate_on_plan: false
+      evaluate_on_plan: true
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -20508,7 +20417,7 @@ entries:
   postgresql:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
-    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -20954,15 +20863,12 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+        pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
         has_pg_cmd = any('max_connections=300' in l for l in lines)
-        # v0.8.8: catch ANY value other than 300s (was 30s in v0.8.4 — too aggressive on slow disks:
-        # Authentik startup migrations exceeded 30s in idle-in-tx state on 1795-IOPS storage,
-        # got killed mid-flight, leaving stale advisory locks and a permanent server crash loop.
-        # 300s tightly bounds zombie idle-in-tx sessions while tolerating slow-disk migrations.)
+        # v0.8.4: catch ANY value other than 30s (was: explicit 300s/10s/120s only — missed manual sed values like 15s)
         _pg_full = ''.join(lines)
         _pg_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
-        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '300')
+        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '30')
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -21048,7 +20954,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
                 f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120
             )
-            plog("  ✓ PostgreSQL recreated with updated tuning (idle_in_transaction_session_timeout=300s)")
+            plog("  ✓ PostgreSQL recreated with updated tuning (idle_in_transaction_session_timeout=30s)")
         else:
             subprocess.run(
                 f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
@@ -21560,603 +21466,6 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
         plog(f"  ⚠ gunicorn timeout error (no changes applied): {e}")
 
 
-def _recreate_authentik_server_worker(plog, reason):
-    """v0.8.7: Force-recreate Authentik server + worker containers (NEVER ldap).
-
-    Used to apply env-var changes (gunicorn only re-reads .env at process startup,
-    so editing ~/authentik/.env is a no-op until the server container is recreated).
-    Called by `_authentik_apply_official_tunings` on startup migrations and
-    post-update auto-deploys, and by the standard Authentik deploy/reconfigure paths.
-
-    NEVER touches the LDAP outpost — preserves bind cache, prevents thundering herd.
-    Records outcome to settings.authentik_last_recreate for operator visibility.
-
-    Args:
-        plog: callable(msg) — for human-readable progress logging
-        reason: short tag identifying the trigger (e.g. 'official-tunings-applied').
-    Returns: True on success, False otherwise.
-    """
-    ak_dir = os.path.expanduser('~/authentik')
-    if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
-        plog("  authentik recreate: ~/authentik not installed, skipping")
-        return False
-
-    started = time.time()
-    plog(f"  authentik recreate: starting (reason={reason}, target=server+worker, ldap=untouched)")
-
-    ok = False
-    err_text = ''
-    try:
-        r = subprocess.run(
-            'cd ~/authentik && docker compose up -d --force-recreate --no-deps server worker',
-            shell=True, capture_output=True, text=True, timeout=180
-        )
-        ok = (r.returncode == 0)
-        if not ok:
-            err_text = ((r.stderr or '') + (r.stdout or ''))[:300]
-    except Exception as e:
-        ok = False
-        err_text = f"exception: {e}"[:300]
-
-    duration = int(time.time() - started)
-    if ok:
-        plog(f"  ✓ authentik recreate complete in {duration}s (server+worker recreated, ldap preserved)")
-    else:
-        plog(f"  ✗ authentik recreate failed (duration={duration}s): {err_text}")
-
-    try:
-        s = load_settings()
-        cfg = s.get('authentik_last_recreate') or {}
-        cfg['last_run_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        cfg['last_outcome'] = 'ok' if ok else 'failed'
-        cfg['last_duration_s'] = duration
-        cfg['last_reason'] = reason
-        if not ok:
-            cfg['last_error'] = err_text
-        elif 'last_error' in cfg:
-            del cfg['last_error']
-        s['authentik_last_recreate'] = cfg
-        save_settings(s)
-    except Exception:
-        pass
-    return ok
-
-
-def _authentik_apply_official_tunings(plog):
-    """v0.8.7: Apply Authentik's officially documented tunings to ~/authentik/.env.
-
-    Apr 30 2026 discovery on tak-10: the v0.8.2 migration set AUTHENTIK_WEB_WORKERS=4
-    in .env, but Authentik 2026.x reads AUTHENTIK_WEB__WORKERS (DOUBLE underscore).
-    Confirmed by `docker top authentik-server-1` showing 2 gunicorn workers (default)
-    despite our config saying 4. Every box in the fleet has been running with half
-    the worker count we thought, since v0.8.2.
-
-    Reference: https://docs.goauthentik.io/install-config/configuration/
-
-    Tunings applied (idempotent — only adds keys missing from .env, never overwrites):
-      - Removes AUTHENTIK_WEB_WORKERS=N (wrong name, was being ignored since v0.8.2)
-      - Adds AUTHENTIK_WEB__WORKERS=4 (correct name; 2x default capacity)
-      - Adds AUTHENTIK_CACHE__TIMEOUT_FLOWS=600 (2x default; flows rarely change)
-      - Adds AUTHENTIK_CACHE__TIMEOUT_POLICIES=600 (2x default; policies rarely change)
-      - Adds AUTHENTIK_LOG_LEVEL=warning (down from info; reduces log overhead)
-
-    Records outcome to settings.authentik_official_tunings for operator audit.
-
-    Caller responsible for restarting the server container after this — env vars are
-    only read at gunicorn startup. Use `_recreate_authentik_server_worker(plog, reason)`.
-
-    Returns True if .env was modified (caller should restart), False if no-op.
-    """
-    ak_dir = os.path.expanduser('~/authentik')
-    env_path = os.path.join(ak_dir, '.env')
-    if not os.path.exists(env_path):
-        plog("  authentik tunings: ~/authentik/.env not found — skipping (Authentik not installed)")
-        return False
-
-    try:
-        with open(env_path) as f:
-            content = f.read()
-    except Exception as e:
-        plog(f"  authentik tunings: read error: {e}")
-        return False
-
-    lines = content.splitlines()
-    actions = []
-
-    new_lines = []
-    removed_old = False
-    for ln in lines:
-        if re.match(r'^AUTHENTIK_WEB_WORKERS\s*=', ln):
-            removed_old = True
-            continue
-        new_lines.append(ln)
-    if removed_old:
-        actions.append('removed AUTHENTIK_WEB_WORKERS (single-underscore wrong name; was being silently ignored since v0.8.2)')
-
-    target_settings = [
-        ('AUTHENTIK_WEB__WORKERS', '4', '4 web workers (vs default 2)'),
-        ('AUTHENTIK_CACHE__TIMEOUT_FLOWS', '600', 'flows cache 600s (vs default 300s) — reduces DB pressure'),
-        ('AUTHENTIK_CACHE__TIMEOUT_POLICIES', '600', 'policies cache 600s (vs default 300s) — reduces DB pressure'),
-        ('AUTHENTIK_LOG_LEVEL', 'warning', 'log level warning (vs default info) — reduces log overhead'),
-    ]
-    for key, value, description in target_settings:
-        existing = next((ln for ln in new_lines if re.match(rf'^{re.escape(key)}\s*=', ln)), None)
-        if existing is not None:
-            actions.append(f'preserved existing operator-set value: {existing.strip()}')
-            continue
-        new_lines.append(f'{key}={value}')
-        actions.append(f'added {key}={value} — {description}')
-
-    new_content = '\n'.join(new_lines).rstrip('\n') + '\n'
-
-    if new_content == content:
-        plog("  authentik tunings: no changes needed (idempotent — already applied or all keys operator-set)")
-        try:
-            s = load_settings()
-            cfg = s.get('authentik_official_tunings') or {}
-            cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-            cfg['last_outcome'] = 'idempotent-noop'
-            s['authentik_official_tunings'] = cfg
-            save_settings(s)
-        except Exception:
-            pass
-        return False
-
-    try:
-        with open(env_path, 'w') as f:
-            f.write(new_content)
-        plog("  authentik tunings: .env updated:")
-        for action in actions:
-            plog(f"    - {action}")
-    except Exception as e:
-        plog(f"  authentik tunings: write error (no changes applied): {e}")
-        return False
-
-    try:
-        s = load_settings()
-        cfg = s.get('authentik_official_tunings') or {}
-        cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        cfg['last_outcome'] = 'applied'
-        cfg['last_actions'] = actions
-        s['authentik_official_tunings'] = cfg
-        save_settings(s)
-    except Exception:
-        pass
-
-    return True
-
-
-def _authentik_verify_runtime_config(plog):
-    """v0.8.7: Verify Authentik's runtime config matches what .env intends.
-
-    Apr 30 2026 lesson: setting AUTHENTIK_WEB_WORKERS=4 in .env was silently ignored
-    for 5 releases. We never knew because we never verified. This function closes
-    the loop by reading what Authentik actually loaded at runtime.
-
-    Two probes:
-      1. `docker exec authentik-worker-1 ak dump_config` for cache.* and log_level
-         (the dump shows YAML config Authentik's Python code reads).
-      2. `docker top authentik-server-1` to count actual gunicorn worker processes
-         (web.workers is consumed by the launcher script, not visible in dump_config).
-
-    Persists pass/fail to settings.authentik_runtime_config_check for operator audit.
-
-    Should be called AFTER a server recreate that should have applied new env vars.
-    Always safe to call. Returns the results dict or None on probe failure.
-    """
-    expected = {
-        'cache.timeout_flows': 600,
-        'cache.timeout_policies': 600,
-        'log_level': 'warning',
-    }
-
-    cfg = None
-    try:
-        r = subprocess.run(
-            'docker exec authentik-worker-1 ak dump_config 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=30
-        )
-        if r.returncode != 0:
-            plog(f"  authentik config verify: ak dump_config failed (rc={r.returncode}); skipping verification")
-            return None
-        out = r.stdout or ''
-        idx = out.find('{')
-        if idx < 0:
-            plog("  authentik config verify: no JSON in dump_config output; skipping")
-            return None
-        cfg = json.loads(out[idx:])
-    except Exception as e:
-        plog(f"  authentik config verify: parse error: {e}")
-        return None
-
-    def get_path(d, path):
-        for part in path.split('.'):
-            if not isinstance(d, dict) or part not in d:
-                return None
-            d = d[part]
-        return d
-
-    results = {}
-    for path, expected_val in expected.items():
-        actual = get_path(cfg, path)
-        results[path] = {'expected': expected_val, 'actual': actual, 'pass': actual == expected_val}
-
-    try:
-        # Apr 30 2026 fix #1: don't pass `-o pid,cmd` to `docker top` — on some Linux
-        # distros that reformats/truncates the CMD column and the grep for
-        # 'gunicorn: worker' misses entirely, returning a false-negative 0.
-        # The default `docker top` output always includes the full CMD column.
-        #
-        # Apr 30 2026 fix #2 (responder spot-check): retry on worker_count==0 to
-        # tolerate the race where the freshly-recreated server container is up but
-        # gunicorn hasn't yet forked its workers. On slow disks that fork can take
-        # 20-40s after the container starts. Without retry, the verifier writes
-        # last_outcome=fail even though the runtime stabilizes correctly seconds
-        # later. We retry every 5s up to 6 times (max 30s total) — only count as
-        # genuine failure if 0 workers persist past that window.
-        worker_count = 0
-        for _attempt in range(6):
-            r2 = subprocess.run(
-                'docker top authentik-server-1 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=10
-            )
-            out = r2.stdout or ''
-            worker_count = sum(1 for ln in out.splitlines() if 'gunicorn: worker' in ln)
-            if worker_count > 0:
-                break
-            time.sleep(5)
-        results['web.workers (process count)'] = {
-            'expected': 4, 'actual': worker_count, 'pass': worker_count == 4
-        }
-    except Exception as _e:
-        results['web.workers (process count)'] = {'expected': 4, 'actual': '?', 'pass': False, 'error': str(_e)[:100]}
-
-    # v0.8.8 probe: Postgres idle_in_transaction_session_timeout. If this is still 30s
-    # the server WILL crash-loop on slow-disk migration (1795 IOPS box on ssdnodes
-    # exhibited this on Apr 30 2026 — Django startup migrations >30s in idle-in-tx).
-    # 300s gives slow disks ~10x headroom while still bounding zombie idle-in-tx sessions.
-    try:
-        r3 = subprocess.run(
-            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc "
-            "\"SHOW idle_in_transaction_session_timeout;\"",
-            shell=True, capture_output=True, text=True, timeout=10
-        )
-        raw = (r3.stdout or '').strip()
-        # Postgres SHOW returns values like "300s", "5min", "300000ms" — normalize to ms
-        ms_actual = None
-        if raw:
-            mm = re.match(r'^(\d+)\s*(ms|s|min)?$', raw)
-            if mm:
-                n = int(mm.group(1))
-                unit = (mm.group(2) or 's').lower()
-                ms_actual = n if unit == 'ms' else (n * 1000 if unit == 's' else n * 60000)
-        ms_expected = 300_000
-        results['pg.idle_in_transaction_session_timeout'] = {
-            'expected': '300s',
-            'actual': raw or '?',
-            'pass': ms_actual == ms_expected
-        }
-    except Exception as _e:
-        results['pg.idle_in_transaction_session_timeout'] = {
-            'expected': '300s', 'actual': '?', 'pass': False, 'error': str(_e)[:100]
-        }
-
-    fails = [k for k, v in results.items() if not v.get('pass')]
-    if fails:
-        plog(f"  authentik config verify: {len(fails)} mismatch(es):")
-        for k in fails:
-            plog(f"    {k}: expected={results[k]['expected']}, actual={results[k]['actual']}")
-    else:
-        plog("  authentik config verify: all checks passed (workers=4, cache=600s, log_level=warning, pg_idle_timeout=300s)")
-
-    try:
-        s = load_settings()
-        cfg_record = s.get('authentik_runtime_config_check') or {}
-        cfg_record['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        cfg_record['last_results'] = results
-        cfg_record['last_outcome'] = 'pass' if not fails else 'fail'
-        s['authentik_runtime_config_check'] = cfg_record
-        save_settings(s)
-    except Exception:
-        pass
-
-    return results
-
-
-def _authentik_fix_ldap_flow_recursion(plog):
-    """v0.8.8: Fix the LDAP flow stage-binding recursion bug.
-
-    Apr 30 2026 discovery on a slow-disk ssdnodes box: Postgres CPU sustained at
-    900-1500% with five backends running 86-second `SELECT FROM
-    authentik_policies_policybindingmodel` queries. LDAP bind volume was 0.36/sec
-    (essentially idle). Root cause: every stage binding on `ldap-authentication-flow`
-    had BOTH `evaluate_on_plan=true` AND `re_evaluate_policies=true`. That combo
-    triggers a cascading policy re-evaluation on every step of every authentication
-    plan: each step re-runs all policy lookups, which re-triggers plan generation,
-    which re-evaluates policies, ad infinitum until the disk catches up. Compare to
-    `default-authentication-flow` which has `evaluate_on_plan=false,
-    re_evaluate_policies=true` — that flow has zero recursion and works fine.
-    Setting `evaluate_on_plan=false` on the three ldap-flow bindings dropped
-    Postgres CPU 115x (~900% → ~7.8%) within 60 seconds and zero long-running
-    queries persisted. The bug was latent on every box that ever ran our blueprint
-    (which includes every infra-TAK install since the LDAP feature shipped); fast
-    disks hide it because each policy query completes in microseconds.
-
-    What this function does:
-      1. Queries Authentik's Postgres directly for stage bindings on the
-         `ldap-authentication-flow` slug with `evaluate_on_plan=true`.
-      2. If any are found, runs an idempotent UPDATE setting them to false.
-         (Leaves `re_evaluate_policies=true` alone — that matches the
-         default flow and isn't part of the recursion combo.)
-      3. If rows were updated, restarts authentik-server-1 ONLY (cardinal rule:
-         LDAP outpost stays untouched, no thundering herd) so the in-memory
-         flow plan cache is rebuilt with the new binding state.
-      4. Persists outcome to `settings.authentik_ldap_flow_recursion_fix` for
-         operator audit.
-
-    Idempotent: returns False if no rows needed fixing (every startup after the
-    first), so the server restart only fires once per box.
-
-    Returns True if fixes were applied (caller may want to log loudly), False
-    if no-op or skipped because the Authentik PG container isn't running.
-    """
-    pg_container = 'authentik-postgresql-1'
-    server_container = 'authentik-server-1'
-
-    try:
-        r = subprocess.run(
-            f"docker ps -q --filter name={pg_container}",
-            shell=True, capture_output=True, text=True, timeout=10
-        )
-        if not (r.stdout or '').strip():
-            plog("  ldap flow recursion: authentik-postgresql-1 not running — skipping")
-            return False
-    except Exception as e:
-        plog(f"  ldap flow recursion: docker probe failed: {e}")
-        return False
-
-    count_sql = (
-        "SELECT COUNT(*) FROM authentik_flows_flowstagebinding fsb "
-        "JOIN authentik_flows_flow f ON f.flow_uuid = fsb.target_id "
-        "WHERE f.slug = 'ldap-authentication-flow' AND fsb.evaluate_on_plan = true;"
-    )
-    try:
-        r = subprocess.run(
-            f"docker exec -i {pg_container} psql -U authentik -d authentik -tAc \"{count_sql}\"",
-            shell=True, capture_output=True, text=True, timeout=15
-        )
-        if r.returncode != 0:
-            plog(f"  ldap flow recursion: count query failed: {(r.stderr or '')[:200]}")
-            return False
-        bad_count = int((r.stdout or '0').strip() or '0')
-    except Exception as e:
-        plog(f"  ldap flow recursion: count parse error: {e}")
-        return False
-
-    if bad_count == 0:
-        plog("  ldap flow recursion: no bindings need fixing (idempotent — already correct)")
-        try:
-            s = load_settings()
-            cfg = s.get('authentik_ldap_flow_recursion_fix') or {}
-            cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-            cfg['last_outcome'] = 'idempotent-noop'
-            cfg['last_bad_count'] = 0
-            s['authentik_ldap_flow_recursion_fix'] = cfg
-            save_settings(s)
-        except Exception:
-            pass
-        return False
-
-    plog(f"  ldap flow recursion: found {bad_count} stage binding(s) with evaluate_on_plan=true — fixing")
-
-    update_sql = (
-        "UPDATE authentik_flows_flowstagebinding "
-        "SET evaluate_on_plan = false "
-        "WHERE target_id IN (SELECT flow_uuid FROM authentik_flows_flow WHERE slug = 'ldap-authentication-flow') "
-        "AND evaluate_on_plan = true;"
-    )
-    try:
-        r = subprocess.run(
-            f"docker exec -i {pg_container} psql -U authentik -d authentik -c \"{update_sql}\"",
-            shell=True, capture_output=True, text=True, timeout=15
-        )
-        if r.returncode != 0:
-            plog(f"  ldap flow recursion: UPDATE failed: {(r.stderr or '')[:200]}")
-            try:
-                s = load_settings()
-                cfg = s.get('authentik_ldap_flow_recursion_fix') or {}
-                cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-                cfg['last_outcome'] = 'failed'
-                cfg['last_error'] = (r.stderr or '')[:200]
-                s['authentik_ldap_flow_recursion_fix'] = cfg
-                save_settings(s)
-            except Exception:
-                pass
-            return False
-    except Exception as e:
-        plog(f"  ldap flow recursion: UPDATE exception: {e}")
-        return False
-
-    plog(f"  ✓ ldap flow recursion: UPDATE applied to {bad_count} binding(s)")
-
-    plog(f"  ldap flow recursion: restarting {server_container} (server only — ldap outpost untouched) to clear flow cache")
-    try:
-        r = subprocess.run(
-            f"docker restart {server_container}",
-            shell=True, capture_output=True, text=True, timeout=60
-        )
-        restart_ok = (r.returncode == 0)
-        if not restart_ok:
-            plog(f"  ✗ ldap flow recursion: server restart failed: {(r.stderr or '')[:200]}")
-    except Exception as e:
-        plog(f"  ✗ ldap flow recursion: server restart exception: {e}")
-        restart_ok = False
-
-    try:
-        s = load_settings()
-        cfg = s.get('authentik_ldap_flow_recursion_fix') or {}
-        cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        cfg['last_outcome'] = 'fixed' if restart_ok else 'fixed-restart-failed'
-        cfg['last_bad_count'] = bad_count
-        s['authentik_ldap_flow_recursion_fix'] = cfg
-        save_settings(s)
-    except Exception:
-        pass
-
-    return True
-
-
-def _authentik_fix_pg_idle_timeout(plog):
-    """v0.8.8: Bump idle_in_transaction_session_timeout from 30s to 300s and
-    unstick any in-flight crash loop caused by the old value.
-
-    Apr 30 2026 discovery on the same slow-disk ssdnodes box that surfaced the
-    LDAP flow recursion bug: after the recursion was fixed, the Authentik server
-    started crash-looping with `psycopg.errors.IdleInTransactionSessionTimeout:
-    terminating connection due to idle-in-transaction timeout`. Root cause: in
-    v0.8.4 we set Postgres `idle_in_transaction_session_timeout=30s` to bound
-    zombie idle-in-tx sessions. On 1795-IOPS storage, Authentik's Django startup
-    migrations can sit in idle-in-tx state for >30s waiting on fsync. Postgres
-    kills the migration mid-flight, leaving a stale advisory lock that prevents
-    the next server boot from acquiring the migration lock — and the server
-    crash-loops forever (`waiting to acquire database lock`).
-
-    Fast disks complete migrations in seconds and never hit this. Slow disks
-    were silently broken until we shipped v0.8.7 + v0.8.8 fixes that triggered
-    enough server restarts to expose the latent issue.
-
-    What this function does:
-      1. Reads ~/authentik/docker-compose.yml; checks the Postgres
-         `idle_in_transaction_session_timeout` arg.
-      2. If still =30s, calls `_ensure_authentik_compose_patches` (which now
-         writes 300s) and force-recreates the Postgres container. The recreate
-         kills ALL sessions, which clears any stale advisory locks the previous
-         crash loop left behind.
-      3. Waits for Postgres to come back ready, then restarts authentik-server
-         and authentik-worker in case they were crash-looping. This is safe
-         even on healthy boxes — same restart cardinal rule as the recursion
-         fix: server + worker only, LDAP outpost untouched.
-      4. Audits outcome to `settings.authentik_pg_idle_timeout_fix`.
-
-    Idempotent: returns False on already-300s boxes (every startup after first).
-    Returns True if the bump was applied.
-    """
-    ak_dir = os.path.expanduser('~/authentik')
-    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
-    if not os.path.exists(compose_path):
-        plog("  pg idle timeout: ~/authentik/docker-compose.yml not found — skipping (Authentik not installed)")
-        return False
-
-    try:
-        with open(compose_path) as f:
-            compose_content = f.read()
-    except Exception as e:
-        plog(f"  pg idle timeout: read error: {e}")
-        return False
-
-    m = re.search(r'idle_in_transaction_session_timeout=(\d+)s', compose_content)
-    if not m:
-        plog("  pg idle timeout: no idle_in_transaction_session_timeout found in compose — skipping (compose not yet patched)")
-        return False
-    current = int(m.group(1))
-    if current == 300:
-        plog("  pg idle timeout: already 300s (idempotent — no-op)")
-        try:
-            s = load_settings()
-            cfg = s.get('authentik_pg_idle_timeout_fix') or {}
-            cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-            cfg['last_outcome'] = 'idempotent-noop'
-            cfg['last_value'] = '300s'
-            s['authentik_pg_idle_timeout_fix'] = cfg
-            save_settings(s)
-        except Exception:
-            pass
-        return False
-
-    plog(f"  pg idle timeout: found idle_in_transaction_session_timeout={current}s — bumping to 300s (slow-disk safe)")
-
-    try:
-        changed = _ensure_authentik_compose_patches(compose_path, plog)
-    except Exception as e:
-        plog(f"  ✗ pg idle timeout: compose patch failed: {e}")
-        return False
-
-    if not changed:
-        plog("  pg idle timeout: compose patcher reported no change — unexpected; skipping recreate")
-        return False
-
-    plog("  pg idle timeout: force-recreating Postgres (kills stuck sessions, clears stale advisory locks, applies new timeout)")
-    try:
-        r = subprocess.run(
-            f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
-            shell=True, capture_output=True, text=True, timeout=180
-        )
-        if r.returncode != 0:
-            plog(f"  ✗ pg idle timeout: Postgres recreate failed: {(r.stdout or r.stderr or '')[:300]}")
-            try:
-                s = load_settings()
-                cfg = s.get('authentik_pg_idle_timeout_fix') or {}
-                cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-                cfg['last_outcome'] = 'failed-recreate'
-                cfg['last_error'] = (r.stdout or r.stderr or '')[:300]
-                s['authentik_pg_idle_timeout_fix'] = cfg
-                save_settings(s)
-            except Exception:
-                pass
-            return False
-    except Exception as e:
-        plog(f"  ✗ pg idle timeout: Postgres recreate exception: {e}")
-        return False
-
-    plog("  pg idle timeout: waiting up to 60s for Postgres to be ready")
-    pg_ready = False
-    for _attempt in range(12):
-        time.sleep(5)
-        try:
-            r = subprocess.run(
-                f'cd {ak_dir} && docker compose exec -T postgresql pg_isready -d authentik -U authentik 2>&1',
-                shell=True, capture_output=True, text=True, timeout=10
-            )
-            if r.returncode == 0 and 'accepting connections' in (r.stdout or ''):
-                pg_ready = True
-                break
-        except Exception:
-            pass
-    if pg_ready:
-        plog("  ✓ pg idle timeout: Postgres ready")
-    else:
-        plog("  ⚠ pg idle timeout: Postgres pg_isready did not confirm ready in 60s — proceeding anyway")
-
-    plog("  pg idle timeout: restarting authentik-server-1 and authentik-worker-1 (clears any crash-loop state — LDAP outpost untouched)")
-    restart_ok = True
-    for cn in ('authentik-server-1', 'authentik-worker-1'):
-        try:
-            r = subprocess.run(
-                f'docker restart {cn}',
-                shell=True, capture_output=True, text=True, timeout=60
-            )
-            if r.returncode != 0:
-                plog(f"  ✗ pg idle timeout: {cn} restart failed: {(r.stderr or '')[:200]}")
-                restart_ok = False
-        except Exception as e:
-            plog(f"  ✗ pg idle timeout: {cn} restart exception: {e}")
-            restart_ok = False
-
-    try:
-        s = load_settings()
-        cfg = s.get('authentik_pg_idle_timeout_fix') or {}
-        cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        cfg['last_outcome'] = 'fixed' if restart_ok else 'fixed-restart-failed'
-        cfg['last_previous_value'] = f'{current}s'
-        cfg['last_new_value'] = '300s'
-        s['authentik_pg_idle_timeout_fix'] = cfg
-        save_settings(s)
-    except Exception:
-        pass
-
-    return True
-
-
 def _authentik_spiral_monitor():
     """v0.8.5: Periodic background monitor for the LDAP routing spiral.
 
@@ -22217,9 +21526,8 @@ def _authentik_spiral_monitor():
             except Exception as _proactive_e:
                 print(f"[spiral monitor] proactive routing pass error (non-fatal): {_proactive_e}", flush=True)
 
-            s = load_settings()
-
             # REACTIVE pass: spiral signature → routing repair (rate-limited to 1 attempt per 6h).
+            s = load_settings()
             last_attempt = s.get('authentik_spiral_last_repair') or {}
             last_ts = last_attempt.get('ts', 0)
             if _t.time() - last_ts < 6 * 3600:
@@ -22613,7 +21921,7 @@ entries:
     state: present
     id: ldap-authentication-login
   - attrs:
-      evaluate_on_plan: false
+      evaluate_on_plan: true
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -22625,7 +21933,7 @@ entries:
     state: present
     id: ldap-identification-stage-flow-binding
   - attrs:
-      evaluate_on_plan: false
+      evaluate_on_plan: true
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -22637,7 +21945,7 @@ entries:
     state: present
     id: ldap-authentication-password-binding
   - attrs:
-      evaluate_on_plan: false
+      evaluate_on_plan: true
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -22747,12 +22055,12 @@ entries:
                 needs_write = True
                 plog("  Added blueprint mount to server & worker")
             # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
-            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
             has_pg_cmd = any('max_connections=300' in l for l in lines)
-        # v0.8.8: catch ANY value other than 300s (was 30s — too aggressive for slow-disk startup migrations)
+        # v0.8.4: catch ANY value other than 30s
         _pg_full = ''.join(lines)
         _pg_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
-        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '300')
+        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '30')
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -22769,132 +22077,132 @@ entries:
                     indent = line[:len(line) - len(line.lstrip())]
                     lines[i] = f'{indent}command: {pg_cmd}\n'
                     needs_write = True
-                    plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 300s")
+                    plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 30s")
                     break
 
-        # Pin AUTHENTIK_TAG to latest stable release
-        ak_tag = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
-        plog(f"  Authentik version: {ak_tag}")
-        for i, l in enumerate(lines):
-            m = re.search(r'AUTHENTIK_TAG:-([^}]+)', l)
-            if m and m.group(1).strip() != ak_tag:
-                lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
+            # Pin AUTHENTIK_TAG to latest stable release
+            ak_tag = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
+            plog(f"  Authentik version: {ak_tag}")
+            for i, l in enumerate(lines):
+                m = re.search(r'AUTHENTIK_TAG:-([^}]+)', l)
+                if m and m.group(1).strip() != ak_tag:
+                    lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
+                    needs_write = True
+            # Inject healthchecks for server and worker if missing (upstream compose may not have them)
+            if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
+                _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
+                patched = []
+                for i, line in enumerate(lines):
+                    patched.append(line)
+                    if line.strip() == 'command: server' or line.strip() == 'command: worker':
+                        patched.append(_hc_block)
+                lines = patched
                 needs_write = True
-        # Inject healthchecks for server and worker if missing (upstream compose may not have them)
-        if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
-            _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
-            patched = []
-            for i, line in enumerate(lines):
-                patched.append(line)
-                if line.strip() == 'command: server' or line.strip() == 'command: worker':
-                    patched.append(_hc_block)
-            lines = patched
-            needs_write = True
-            plog("  Added healthchecks for server and worker")
-        else:
-            # Upstream compose has healthchecks — ensure start_period is long enough for first-run migrations
-            for i, line in enumerate(lines):
-                if 'start_period' in line and 'start_period: 600s' not in line:
-                    # Only patch start_period inside server/worker healthcheck blocks (not pg/redis)
-                    # Check if this is under a server or worker service by looking backwards
-                    for j in range(i - 1, max(i - 15, 0), -1):
-                        if lines[j].strip().startswith('command: server') or lines[j].strip().startswith('command: worker'):
-                            lines[i] = re.sub(r'start_period:\s*\S+', 'start_period: 600s', line)
-                            needs_write = True
-                            break
-                        if lines[j].strip().startswith('image:') and 'postgres' in lines[j]:
-                            break
-                        if lines[j].strip().startswith('image:') and 'redis' in lines[j]:
-                            break
-            if needs_write:
-                plog("  Updated healthcheck start_period to 600s for first-run migrations")
-
-        ldap_image = f"ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{ak_tag}}}"
-        if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
-            ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 127.0.0.1:389:3389\n    - 127.0.0.1:636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
-            new_lines = []
-            for line in lines:
-                if line.startswith('volumes:'):
-                    new_lines.append(ldap_svc)
-                new_lines.append(line)
-            lines = new_lines
-            needs_write = True
-            plog("  Added LDAP outpost container")
-        else:
-            # Ensure existing LDAP block uses AUTHENTIK_TAG so Update pulls same version as server
-            for i, line in enumerate(lines):
-                m = re.search(r'image:\s*ghcr\.io/goauthentik/ldap:([^\s\n]+)', line)
-                if m:
-                    current = m.group(1)
-                    if not current.startswith('${AUTHENTIK_TAG'):
-                        lines[i] = line.replace(f'ghcr.io/goauthentik/ldap:{current}', ldap_image, 1)
-                        needs_write = True
-                        plog(f"  Updated LDAP image to use AUTHENTIK_TAG (default {ak_tag})")
-                    break
-        if needs_write:
-            with open(compose_path, 'w') as f:
-                f.writelines(lines)
-            plog("\u2713 Docker Compose patched")
-        else:
-            plog("\u2713 Docker Compose already patched")
-        if _patch_authentik_compose_network():
-            plog("  \u2713 infratak network added to docker-compose.yml")
-
-        # Step 7: Pull and start core services (no verbose docker output in log)
-        plog("")
-        plog("\u2501\u2501\u2501 Step 7/10: Pulling Images & Starting Containers \u2501\u2501\u2501")
-        # Ensure 4GB swap before stressing the box (reduces OOM/unhealthy on small VPS)
-        try:
-            r_sw = subprocess.run(['swapon', '--show'], capture_output=True, text=True, timeout=5)
-            if r_sw.returncode == 0 and '/swapfile' in (r_sw.stdout or ''):
-                plog("  Swap already configured")
+                plog("  Added healthchecks for server and worker")
             else:
-                if os.path.exists('/swapfile'):
-                    subprocess.run(['swapon', '/swapfile'], capture_output=True, timeout=5)
-                    with open('/etc/fstab', 'r') as f:
-                        fstab = f.read()
-                    if '/swapfile' not in fstab:
-                        with open('/etc/fstab', 'a') as f:
-                            f.write('\n/swapfile swap swap defaults 0 0\n')
-                    plog("  Swap file enabled")
+                # Upstream compose has healthchecks — ensure start_period is long enough for first-run migrations
+                for i, line in enumerate(lines):
+                    if 'start_period' in line and 'start_period: 600s' not in line:
+                        # Only patch start_period inside server/worker healthcheck blocks (not pg/redis)
+                        # Check if this is under a server or worker service by looking backwards
+                        for j in range(i - 1, max(i - 15, 0), -1):
+                            if lines[j].strip().startswith('command: server') or lines[j].strip().startswith('command: worker'):
+                                lines[i] = re.sub(r'start_period:\s*\S+', 'start_period: 600s', line)
+                                needs_write = True
+                                break
+                            if lines[j].strip().startswith('image:') and 'postgres' in lines[j]:
+                                break
+                            if lines[j].strip().startswith('image:') and 'redis' in lines[j]:
+                                break
+                if needs_write:
+                    plog("  Updated healthcheck start_period to 600s for first-run migrations")
+
+            ldap_image = f"ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{ak_tag}}}"
+            if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
+                ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 127.0.0.1:389:3389\n    - 127.0.0.1:636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
+                new_lines = []
+                for line in lines:
+                    if line.startswith('volumes:'):
+                        new_lines.append(ldap_svc)
+                    new_lines.append(line)
+                lines = new_lines
+                needs_write = True
+                plog("  Added LDAP outpost container")
+            else:
+                # Ensure existing LDAP block uses AUTHENTIK_TAG so Update pulls same version as server
+                for i, line in enumerate(lines):
+                    m = re.search(r'image:\s*ghcr\.io/goauthentik/ldap:([^\s\n]+)', line)
+                    if m:
+                        current = m.group(1)
+                        if not current.startswith('${AUTHENTIK_TAG'):
+                            lines[i] = line.replace(f'ghcr.io/goauthentik/ldap:{current}', ldap_image, 1)
+                            needs_write = True
+                            plog(f"  Updated LDAP image to use AUTHENTIK_TAG (default {ak_tag})")
+                        break
+            if needs_write:
+                with open(compose_path, 'w') as f:
+                    f.writelines(lines)
+                plog("\u2713 Docker Compose patched")
+            else:
+                plog("\u2713 Docker Compose already patched")
+            if _patch_authentik_compose_network():
+                plog("  \u2713 infratak network added to docker-compose.yml")
+
+            # Step 7: Pull and start core services (no verbose docker output in log)
+            plog("")
+            plog("\u2501\u2501\u2501 Step 7/10: Pulling Images & Starting Containers \u2501\u2501\u2501")
+            # Ensure 4GB swap before stressing the box (reduces OOM/unhealthy on small VPS)
+            try:
+                r_sw = subprocess.run(['swapon', '--show'], capture_output=True, text=True, timeout=5)
+                if r_sw.returncode == 0 and '/swapfile' in (r_sw.stdout or ''):
+                    plog("  Swap already configured")
                 else:
-                    subprocess.run(['fallocate', '-l', '4G', '/swapfile'], check=True, timeout=30)
-                    os.chmod('/swapfile', 0o600)
-                    subprocess.run(['mkswap', '/swapfile'], check=True, capture_output=True, timeout=10)
-                    subprocess.run(['swapon', '/swapfile'], check=True, timeout=10)
-                    with open('/etc/fstab', 'r') as f:
-                        fstab = f.read()
-                    if '/swapfile' not in fstab:
-                        with open('/etc/fstab', 'a') as f:
-                            f.write('\n/swapfile swap swap defaults 0 0\n')
-                    plog("  4GB swap configured (reduces Authentik OOM on small VPS)")
-        except Exception as e:
-            plog(f"  \u26a0 Swap setup skipped: {e}")
-        plog("  Pulling images (this may take a few minutes)...")
-        r = subprocess.run(f'cd {ak_dir} && docker compose pull 2>&1', shell=True, capture_output=True, text=True, timeout=600)
-        if r.returncode != 0:
-            plog(f"  \u26a0 Pull had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
-        else:
-            plog("  \u2713 Images pulled")
-        plog("  Starting PostgreSQL...")
-        r = subprocess.run(f'cd {ak_dir} && docker compose up -d postgresql 2>&1', shell=True, capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            plog(f"  \u26a0 Postgres start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
-        for attempt in range(24):
-            rp = subprocess.run(f'cd {ak_dir} && docker compose exec -T postgresql pg_isready 2>/dev/null', shell=True, capture_output=True, text=True, timeout=10)
-            if rp.returncode == 0:
-                plog("  \u2713 PostgreSQL ready")
-                break
-            time.sleep(2)
-        else:
-            plog("  \u26a0 PostgreSQL not ready in time, starting server anyway")
-        plog("  Starting server and worker...")
-        r = subprocess.run(f'cd {ak_dir} && docker compose up -d server worker 2>&1', shell=True, capture_output=True, text=True, timeout=120)
-        _ensure_infratak_network_for_authentik()
-        if r.returncode != 0:
-            plog(f"  \u26a0 Start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
-        else:
-            plog("  \u2713 Core services started")
+                    if os.path.exists('/swapfile'):
+                        subprocess.run(['swapon', '/swapfile'], capture_output=True, timeout=5)
+                        with open('/etc/fstab', 'r') as f:
+                            fstab = f.read()
+                        if '/swapfile' not in fstab:
+                            with open('/etc/fstab', 'a') as f:
+                                f.write('\n/swapfile swap swap defaults 0 0\n')
+                        plog("  Swap file enabled")
+                    else:
+                        subprocess.run(['fallocate', '-l', '4G', '/swapfile'], check=True, timeout=30)
+                        os.chmod('/swapfile', 0o600)
+                        subprocess.run(['mkswap', '/swapfile'], check=True, capture_output=True, timeout=10)
+                        subprocess.run(['swapon', '/swapfile'], check=True, timeout=10)
+                        with open('/etc/fstab', 'r') as f:
+                            fstab = f.read()
+                        if '/swapfile' not in fstab:
+                            with open('/etc/fstab', 'a') as f:
+                                f.write('\n/swapfile swap swap defaults 0 0\n')
+                        plog("  4GB swap configured (reduces Authentik OOM on small VPS)")
+            except Exception as e:
+                plog(f"  \u26a0 Swap setup skipped: {e}")
+            plog("  Pulling images (this may take a few minutes)...")
+            r = subprocess.run(f'cd {ak_dir} && docker compose pull 2>&1', shell=True, capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                plog(f"  \u26a0 Pull had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
+            else:
+                plog("  \u2713 Images pulled")
+            plog("  Starting PostgreSQL...")
+            r = subprocess.run(f'cd {ak_dir} && docker compose up -d postgresql 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                plog(f"  \u26a0 Postgres start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
+            for attempt in range(24):
+                rp = subprocess.run(f'cd {ak_dir} && docker compose exec -T postgresql pg_isready 2>/dev/null', shell=True, capture_output=True, text=True, timeout=10)
+                if rp.returncode == 0:
+                    plog("  \u2713 PostgreSQL ready")
+                    break
+                time.sleep(2)
+            else:
+                plog("  \u26a0 PostgreSQL not ready in time, starting server anyway")
+            plog("  Starting server and worker...")
+            r = subprocess.run(f'cd {ak_dir} && docker compose up -d server worker 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+            _ensure_infratak_network_for_authentik()
+            if r.returncode != 0:
+                plog(f"  \u26a0 Start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
+            else:
+                plog("  \u2713 Core services started")
 
         # Step 8: Wait for Authentik API to be ready
         plog("")
@@ -23722,47 +23030,7 @@ entries:
                 time.sleep(5)
         if not _ldap_port_ready:
             plog("  ⚠ LDAP port 389 not open after 180s — bind check may fail")
-        # Wait for LDAP container Docker health to be 'healthy' before burning SA bind attempts.
-        # Port open only means the container process started — it still needs to sync with
-        # the Authentik server before it will accept bind requests. On slow VPS (< 200 MB/s)
-        # this sync takes 2-5 minutes. Without this wait, all 24 bind attempts are consumed
-        # while the outpost is still initialising. Cap wait at 5 min (300s).
-        plog("  Waiting for LDAP outpost to be healthy...")
-        _ldap_healthy = False
-        _ldap_wait_start = time.time()
-        for _lh in range(60):  # 60 × 5s = 300s max
-            try:
-                r_lh = subprocess.run(
-                    'docker inspect --format "{{.State.Health.Status}}" authentik-ldap-1 2>/dev/null',
-                    shell=True, capture_output=True, text=True, timeout=5
-                )
-                _h_status = (r_lh.stdout or '').strip().lower()
-                if _h_status == 'healthy':
-                    _elapsed = int(time.time() - _ldap_wait_start)
-                    plog(f"  ✓ LDAP outpost healthy ({_elapsed}s)")
-                    _ldap_healthy = True
-                    break
-                if _h_status in ('', 'none') and _lh > 6:
-                    # Container has no healthcheck — fall through after a brief wait
-                    break
-            except Exception:
-                pass
-            time.sleep(5)
-        if not _ldap_healthy:
-            plog("  ⚠ LDAP outpost not healthy yet — proceeding to bind check anyway")
-        # Re-apply the flow fix right before the final bind check. The Authentik worker
-        # may have re-processed blueprints async during Step 12, resetting password_stage
-        # on ldap-identification-stage — which causes "exceeded stage recursion depth".
-        # Calling this here ensures the fix is applied AFTER any blueprint re-processing.
-        try:
-            ok_fn, err_fn = _ensure_ldap_flow_authentication_none()
-            if ok_fn:
-                plog("  ✓ LDAP flow re-verified (no recursion)")
-            else:
-                plog(f"  ⚠ LDAP flow re-verify: {err_fn or 'skipped'}")
-        except Exception as _e:
-            plog(f"  ⚠ LDAP flow re-verify skipped: {_e}")
-        time.sleep(3)
+        time.sleep(5)
         if not _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=24, delay_sec=10):
             _update_boot_stagger_service()
             authentik_deploy_status.update({'running': False, 'complete': False, 'error': True})
@@ -24611,16 +23879,10 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
     for _ in range(3):
         if has_ldapsearch and not is_remote:
             try:
-                # Search ou=users (not dc= root) so the search itself also succeeds.
-                # Authentik doesn't expose a root object at dc=takldap, so a base-scope
-                # search there returns LDAP error 32 ("no such object") even when the
-                # bind succeeded — causing ldapsearch to exit non-zero every time.
-                _cn = user_hint or 'adm_ldapservice'
                 lr = subprocess.run(
                     ['ldapsearch', '-x', '-H', f'ldap://{ldap_host}:389',
                      '-D', bind_dn, '-w', bind_pass,
-                     '-b', 'ou=users,dc=takldap', '-s', 'one',
-                     f'(cn={_cn})', 'cn'],
+                     '-b', 'dc=takldap', '-s', 'base', '(objectClass=*)'],
                     capture_output=True, text=True, timeout=15)
                 out = ((lr.stdout or '') + '\n' + (lr.stderr or '')).lower()
                 if lr.returncode == 0 and 'invalid credentials' not in out:
@@ -24630,17 +23892,14 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
             except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
                 pass
 
-        # Sleep long enough that any log entry written by the bind above has been
-        # flushed and captured before we read docker logs.  2 s was a race on slow
-        # Azure disks where the log landed at the same second as our check.
-        time.sleep(5)
+        time.sleep(2)
         if is_remote:
             ok, out = _ssh_probe(ak_cfg.get('remote', {}),
-                'docker logs authentik-ldap-1 --since 90s 2>&1', timeout=15)
+                'docker logs authentik-ldap-1 --since 45s 2>&1', timeout=15)
             log = (out or '').lower()
         else:
             r = subprocess.run(
-                'docker logs authentik-ldap-1 --since 90s 2>&1',
+                'docker logs authentik-ldap-1 --since 45s 2>&1',
                 shell=True, capture_output=True, text=True, timeout=10)
             log = (r.stdout or '').lower()
 
@@ -24702,20 +23961,6 @@ def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, del
         if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
             plog("  \u2713 LDAP service-account bind verified (adm_ldapservice). Safe to proceed to TAK Server.")
             return True
-        # Fallback: directly check Docker logs for a recent "authenticated from session"
-        # entry for the SA.  This catches the case where ldapsearch's exit code is
-        # misleading (e.g. bind succeeds but base-scope search returns LDAP error 32)
-        # and _test_ldap_bind_dn_verdict mis-classifies the result as inconclusive.
-        try:
-            r_fb = subprocess.run(
-                'docker logs authentik-ldap-1 --since 90s 2>&1',
-                shell=True, capture_output=True, text=True, timeout=10)
-            fb_log = (r_fb.stdout or '').lower()
-            if 'authenticated from session' in fb_log and 'adm_ldapservice' in fb_log:
-                plog("  \u2713 LDAP SA bind verified via Docker log (authenticated from session). Safe to proceed.")
-                return True
-        except Exception:
-            pass
         if i < attempts:
             time.sleep(delay_sec)
     plog("  \u2717 Final LDAP SA bind failed after Caddy/SMTP/restart.")
@@ -24883,7 +24128,7 @@ def _ensure_ldap_flow_authentication_none():
                             try:
                                 _post('flows/bindings/', {
                                     'target': ldap_flow_pk, 'stage': stage_pk, 'order': order,
-                                    'evaluate_on_plan': False, 're_evaluate_policies': True,
+                                    'evaluate_on_plan': True, 're_evaluate_policies': True,
                                     'policy_engine_mode': 'any', 'invalid_response_action': 'retry'})
                             except urllib.error.HTTPError:
                                 pass
@@ -29654,7 +28899,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% else %}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
-<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif key == 'frigate' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">videocam</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
+<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
 {% if not mod.get('icon_url') or key == 'takportal' or key == 'fedhub' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
@@ -29697,16 +28942,16 @@ async function toggleUU(cb){
 }
 function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
 function cpuColor(pct){var n=Number(pct||0);if(n>=90)return 'var(--red)';if(n>=70)return '#eab308';return 'var(--green)';}
-function diskIoColor(mbs){var m=Number(mbs||0);if(m>=200)return 'var(--green)';if(m>=80)return '#eab308';return 'var(--red)';}
+function diskIoColor(currentMbs,speedTestMbs){var c=Number(currentMbs||0);var s=Number(speedTestMbs);if(s>0){var pct=(c/s)*100;if(pct>=75)return 'var(--red)';if(pct>=40)return '#eab308';return 'var(--green)';}if(c>=100)return 'var(--red)';if(c>=30)return '#eab308';return 'var(--green)';}
 function renderResourceBreakdown(div,data,hostId){
-    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,vcpuCount=data.vcpu_count,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedRead=data.disk_speed_test_read_mbs,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
+    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs,speedRead=data.disk_speed_test_read_mbs,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
     if(err){div.innerHTML='<span style="color:var(--red)">'+escapeHtml(err)+'</span>'+(hostId?' <button type="button" onclick="refreshResourceBreakdown(\\''+hostId+'\\')" style="margin-left:8px;padding:2px 8px;font-size:10px;background:rgba(59,130,246,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:4px;cursor:pointer">Refresh</button>':'');return;}
     var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left', th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)', td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)', r='text-align:right';
     var html='';
-    if(processor){html+='<div style="margin-bottom:2px;color:var(--text-dim);font-size:10px">Processor: '+escapeHtml(processor)+'</div>';if(vcpuCount)html+='<div style="margin-bottom:4px;padding-left:8px;color:var(--cyan);font-size:10px;font-weight:600">'+vcpuCount+' vCPUs</div>';}
+    if(processor)html+='<div style="margin-bottom:4px;color:var(--text-dim);font-size:10px">Processor: '+escapeHtml(processor)+'</div>';
     if(totalRamGb!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
-    if(diskWrite!=null&&diskSrc==='sync'){var dw=Number(diskWrite),cwColor=diskIoColor(dw);html+='<div style="margin-bottom:4px;font-size:10px">Disk write speed (Guard Dog): <span style="color:'+cwColor+'">'+dw.toFixed(0)+' MB/s</span></div>';}
-    if(speedWrite!=null){var sw=Number(speedWrite),swColor=diskIoColor(sw);html+='<div style="margin-bottom:6px;font-size:10px">Disk speed test (256 MiB): <span style="color:'+swColor+'">'+sw.toFixed(0)+' MB/s</span></div>';}
+    if(diskRead!=null&&diskWrite!=null){var dr=Number(diskRead),dw=Number(diskWrite);var cr=diskIoColor(dr,speedRead),cw=diskIoColor(dw,speedWrite);html+='<div style="margin-bottom:4px;font-size:10px">Disk I/O (current): <span style="color:'+cr+'">'+dr.toFixed(2)+' MB/s</span> read, <span style="color:'+cw+'">'+dw.toFixed(2)+' MB/s</span> write</div>';}
+    if(speedRead!=null&&speedWrite!=null)html+='<div style="margin-bottom:6px;color:var(--cyan);font-size:10px">Disk speed test (256 MiB): <strong>'+Number(speedRead).toFixed(0)+' MB/s</strong> read, <strong>'+Number(speedWrite).toFixed(0)+' MB/s</strong> write</div>';
     else if(speedErr)html+='<div style="margin-bottom:6px;color:var(--text-dim);font-size:10px">Disk speed test: <span style="color:var(--red)">'+escapeHtml(speedErr)+'</span></div>';
     var ramCell='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;color:var(--text-dim);white-space:nowrap';
     if(cpuTop&&cpuTop.length){
@@ -29975,7 +29220,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% else %}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
-<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif key == 'frigate' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">videocam</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
+<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
 {% if not mod.get('icon_url') or key == 'takportal' or key == 'fedhub' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
@@ -30621,53 +29866,6 @@ def _startup_migrations():
                 print(f"Startup migration: Guard Dog stamped at {VERSION}")
             except Exception as gu_err:
                 print(f"Startup migration: Guard Dog stamp error: {gu_err}")
-
-        # v0.8.7: Apply Authentik official tunings (env var name fix + cache + log level).
-        # The function is idempotent: returns False if no changes needed (every startup
-        # after the first), so the recreate only fires once per box. Migrates the v0.8.2
-        # AUTHENTIK_WEB_WORKERS=4 (single underscore — silently ignored by Authentik 2026.x)
-        # to AUTHENTIK_WEB__WORKERS=4 (correct double-underscore name).
-        try:
-            if os.path.exists(os.path.expanduser('~/authentik/.env')):
-                changed = _authentik_apply_official_tunings(lambda m: print(f"Startup migration: {m}", flush=True))
-                if changed:
-                    print("Startup migration: authentik .env updated — recreating server+worker to apply", flush=True)
-                    _recreate_authentik_server_worker(
-                        lambda m: print(f"Startup migration: {m}", flush=True),
-                        reason='official-tunings-migration'
-                    )
-                    time.sleep(15)
-                    _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
-                else:
-                    # Run verifier even when no changes — closes the audit loop on every startup.
-                    _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
-        except Exception as ak_tune_err:
-            print(f"Startup migration: authentik tunings error (non-fatal): {ak_tune_err}")
-
-        # v0.8.8: Bump idle_in_transaction_session_timeout 30s → 300s. MUST run before
-        # the recursion fix below, because the recursion fix restarts authentik-server,
-        # and on a slow-disk box with the old 30s timeout the new server's Django startup
-        # migrations would get killed mid-flight and crash-loop the box. Idempotent:
-        # no-op on already-300s boxes, and on first-fire it force-recreates Postgres
-        # which kills any stale advisory locks left by previous crash loops.
-        try:
-            _pg_changed = _authentik_fix_pg_idle_timeout(lambda m: print(f"Startup migration: {m}", flush=True))
-            if _pg_changed:
-                # The verifier above ran with the pre-migration 30s/600s value and recorded
-                # last_outcome=fail. Re-run it now that Postgres has the new 300s so the
-                # operator audit reflects current truth instead of stale "fail".
-                _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
-        except Exception as ak_pg_err:
-            print(f"Startup migration: pg idle timeout fix error (non-fatal): {ak_pg_err}")
-
-        # v0.8.8: Fix LDAP flow stage-binding recursion (evaluate_on_plan=true + re_evaluate_policies=true).
-        # Idempotent — only fires the SQL UPDATE + server restart on boxes where the bug
-        # is still present (i.e. boxes deployed before v0.8.8). On already-fixed boxes
-        # this is a single COUNT query and a settings.json audit write.
-        try:
-            _authentik_fix_ldap_flow_recursion(lambda m: print(f"Startup migration: {m}", flush=True))
-        except Exception as ak_recursion_err:
-            print(f"Startup migration: ldap flow recursion fix error (non-fatal): {ak_recursion_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
@@ -30813,47 +30011,31 @@ def _post_update_auto_deploy():
             except Exception as _e:
                 print(f"Post-update: v0.8.4 LDAP routing repair skipped: {_e}")
 
-            # v0.8.7 SUPERSEDES v0.8.2 worker count migration.
-            # The v0.8.2 migration wrote AUTHENTIK_WEB_WORKERS (single underscore), but
-            # Authentik 2026.x requires AUTHENTIK_WEB__WORKERS (double underscore). The
-            # value was silently ignored on every box for ~5 releases. Apr 30 2026 dump_config
-            # on tak-10 confirmed: 2 actual gunicorn workers despite "=4" in .env.
-            # _authentik_apply_official_tunings handles the rename + applies cache/log tunings.
+            # Ensure AUTHENTIK_WEB_WORKERS=4 so the flow executor has enough capacity to handle
+            # bind storms after restarts without thundering-herd overload. Only restarts the
+            # server container (not ldap) — server restarts are fast and do not clear bind caches.
             try:
-                if os.path.exists(os.path.expanduser('~/authentik/.env')):
-                    changed = _authentik_apply_official_tunings(lambda m: print(f"Post-update: {m}", flush=True))
-                    if changed:
-                        _recreate_authentik_server_worker(
-                            lambda m: print(f"Post-update: {m}", flush=True),
-                            reason='official-tunings-migration'
-                        )
-                        time.sleep(15)
-                        _authentik_verify_runtime_config(lambda m: print(f"Post-update: {m}", flush=True))
+                ak_env = os.path.expanduser('~/authentik/.env')
+                if os.path.exists(ak_env):
+                    with open(ak_env) as _f:
+                        _env_text = _f.read()
+                    import re as _re2
+                    _existing = _re2.search(r'^AUTHENTIK_WEB_WORKERS\s*=\s*(\d+)', _env_text, _re2.M)
+                    _current_workers = int(_existing.group(1)) if _existing else 0
+                    if _current_workers < 4:
+                        if _existing:
+                            _env_text = _re2.sub(r'^AUTHENTIK_WEB_WORKERS\s*=.*', 'AUTHENTIK_WEB_WORKERS=4', _env_text, flags=_re2.M)
+                        else:
+                            _env_text = _env_text.rstrip('\n') + '\nAUTHENTIK_WEB_WORKERS=4\n'
+                        with open(ak_env, 'w') as _f:
+                            _f.write(_env_text)
+                        subprocess.run('cd ~/authentik && docker compose restart server',
+                            shell=True, capture_output=True, text=True, timeout=120)
+                        print("Post-update: set AUTHENTIK_WEB_WORKERS=4 and restarted server (ldap untouched)")
+                    else:
+                        print(f"Post-update: AUTHENTIK_WEB_WORKERS already={_current_workers}, no change")
             except Exception as _e:
-                print(f"Post-update: authentik tunings migration skipped: {_e}")
-
-            # v0.8.8: Bump idle_in_transaction_session_timeout 30s → 300s. MUST run before
-            # the recursion fix below — see _startup_migrations comment for rationale.
-            # On a stuck crash-looping box this also unsticks the box by force-recreating
-            # Postgres (kills stale advisory locks) and restarting server+worker.
-            try:
-                if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
-                    _pg_changed = _authentik_fix_pg_idle_timeout(lambda m: print(f"Post-update: {m}", flush=True))
-                    if _pg_changed:
-                        # Re-run the verifier so the post-migration 300s value lands in the
-                        # operator audit instead of the stale pre-migration value.
-                        _authentik_verify_runtime_config(lambda m: print(f"Post-update: {m}", flush=True))
-            except Exception as _e:
-                print(f"Post-update: pg idle timeout fix skipped: {_e}")
-
-            # v0.8.8: Fix LDAP flow stage-binding recursion bug. Idempotent — only fixes
-            # bindings that still have evaluate_on_plan=true (boxes deployed before v0.8.8).
-            # If fixes were applied, restarts authentik-server-1 only (LDAP outpost untouched).
-            try:
-                if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
-                    _authentik_fix_ldap_flow_recursion(lambda m: print(f"Post-update: {m}", flush=True))
-            except Exception as _e:
-                print(f"Post-update: ldap flow recursion fix skipped: {_e}")
+                print(f"Post-update: AUTHENTIK_WEB_WORKERS fix skipped: {_e}")
 
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
@@ -31319,216 +30501,6 @@ try:
     _threading_spiral.Thread(target=_authentik_spiral_monitor, daemon=True, name='authentik-spiral-monitor').start()
 except Exception as _e:
     print(f"[startup] failed to start spiral monitor (non-fatal): {_e}", flush=True)
-
-
-# === Frigate NVR Module ===
-FRIGATE_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Frigate NVR — infra-TAK</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
-<style>''' + BASE_CSS + '''
-.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;white-space:pre-wrap}
-.instruction-step{margin-bottom:20px;padding-left:12px;border-left:2px solid var(--accent)}
-.instruction-title{font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:4px}
-.instruction-text{font-size:13px;color:var(--text-secondary);line-height:1.5}
-.code-inline{font-family:\'JetBrains Mono\',monospace;background:rgba(255,255,255,0.05);padding:2px 4px;border-radius:4px;font-size:12px}
-</style></head>
-<body>
-{{ sidebar_html }}
-<div class="main">
-  <div class="page-header"><h1 style="display:flex;flex-direction:column;align-items:flex-start;gap:6px"><span class="nav-icon material-symbols-outlined" style="font-size:32px">videocam</span><span>Frigate NVR</span></h1><p>AI-powered NVR with object detection</p></div>
-  
-  {% if frigate.running %}<div class="status-banner running"><div class="dot"></div>Frigate is running</div>
-  {% elif frigate.installed %}<div class="status-banner stopped"><div class="dot"></div>Frigate is installed but stopped</div>
-  {% else %}<div class="status-banner not-installed"><div class="dot"></div>Frigate is not installed</div>{% endif %}
-  
-  {% if not frigate.installed %}
-  <div class="card">
-    <div class="card-title">Pre-Deployment Guide</div>
-    <div class="instruction-step">
-      <div class="instruction-title">1. Stream Source (MediaMTX)</div>
-      <div class="instruction-text">Frigate requires an RTSP stream to analyze. By default, this deployment expects a stream at <span class="code-inline">uas_1</span> on your local MediaMTX instance.</div>
-    </div>
-    <div class="instruction-step">
-      <div class="instruction-title">2. Hardware Resources</div>
-      <div class="instruction-text">AI object detection is CPU intensive. For production, a <strong>Google Coral TPU</strong> is highly recommended. This deployment uses CPU detection by default.</div>
-    </div>
-    <div class="instruction-step">
-      <div class="instruction-title">3. Storage Space</div>
-      <div class="instruction-text">Recordings and snapshots will be stored in <span class="code-inline">~/frigate/storage</span>. Ensure you have enough disk space for your retention policy.</div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Deploy Frigate NVR</div>
-    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">Clicking deploy will create the <span class="code-inline">~/frigate</span> directory, generate a starter configuration, and start the Docker container.</p>
-    <div class="controls">
-      <button class="btn btn-primary" id="deploy-btn" onclick="deployFrigate()">Begin Deployment</button>
-    </div>
-    <div id="deploy-log-container" style="display:none;margin-top:24px">
-      <div class="section-title">Deployment Log</div>
-      <div class="log-box" id="deploy-log"></div>
-    </div>
-  </div>
-  {% else %}
-  <div class="card">
-    <div class="card-title">Frigate Web UI</div>
-    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">The Frigate dashboard allows you to view live streams, review events, and tune detection parameters.</p>
-    <div class="controls">
-      <a href="http://{{ settings.get(\'server_ip\', \'localhost\') }}:5000" target="_blank" class="btn btn-success">Open Frigate UI <span class="material-symbols-outlined" style="font-size:16px">open_in_new</span></a>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Management & Customization</div>
-    <div class="instruction-step">
-      <div class="instruction-title">Configuration File</div>
-      <div class="instruction-text">To add cameras or change AI settings, edit: <span class="code-inline">~/frigate/config.yml</span></div>
-    </div>
-    <div class="instruction-step">
-      <div class="instruction-title">Restart Service</div>
-      <div class="instruction-text">After changing settings, restart the container via SSH: <br><span class="code-inline">cd ~/frigate && docker compose restart</span></div>
-    </div>
-    <div style="margin-top:24px;padding-top:20px;border-top:1px solid var(--border)">
-      <button class="btn btn-danger" onclick="confirmRemoveFrigate()">Remove Frigate NVR</button>
-    </div>
-  </div>
-  {% endif %}
-</div>
-<script>
-async function deployFrigate() {
-    const btn = document.getElementById(\'deploy-btn\');
-    btn.disabled = true; btn.textContent = \'Deploying...\';
-    document.getElementById(\'deploy-log-container\').style.display = \'block\';
-    const r = await fetch(\'/api/frigate/deploy\', {method:\'POST\'});
-    pollLog();
-}
-async function pollLog() {
-    const logBox = document.getElementById(\'deploy-log\');
-    let lastIdx = 0;
-    const interval = setInterval(async () => {
-        const r = await fetch(\'/api/frigate/deploy/log?index=\' + lastIdx);
-        const d = await r.json();
-        d.entries.forEach(e => {
-            const div = document.createElement(\'div\');
-            div.textContent = e;
-            logBox.appendChild(div);
-            logBox.scrollTop = logBox.scrollHeight;
-        });
-        lastIdx = d.total;
-        if (d.complete || d.error) {
-            clearInterval(interval);
-            if (d.complete) setTimeout(() => location.reload(), 2000);
-        }
-    }, 1000);
-}
-function confirmRemoveFrigate() {
-    if (confirm("Permanently remove Frigate NVR? Config and storage folders will be preserved.")) {
-        fetch(\'/api/frigate/remove\', {method:\'POST\'}).then(() => location.reload());
-    }
-}
-</script>
-</body></html>'''
-
-@app.route('/frigate')
-@login_required
-def frigate_page():
-    settings = load_settings()
-    modules = detect_modules()
-    frigate = modules.get('frigate', {})
-    sidebar_html = render_sidebar(modules, 'frigate')
-    return render_template_string(FRIGATE_TEMPLATE,
-        settings=settings, frigate=frigate, version=VERSION,
-        sidebar_html=sidebar_html, frigate_logo_url=FRIGATE_LOGO_URL)
-
-@app.route('/api/frigate/deploy', methods=['POST'])
-@login_required
-def frigate_deploy():
-    if frigate_deploy_status.get('running'):
-        return jsonify({'error': 'Deployment already in progress'}), 409
-    frigate_deploy_log.clear()
-    frigate_deploy_status.update({'running': True, 'complete': False, 'error': False})
-    threading.Thread(target=run_frigate_deploy, daemon=True).start()
-    return jsonify({'success': True})
-
-@app.route('/api/frigate/remove', methods=['POST'])
-@login_required
-def frigate_remove():
-    frigate_dir = os.path.expanduser('~/frigate')
-    subprocess.run(f'cd {frigate_dir} && docker compose down', shell=True, capture_output=True)
-    if os.path.exists(os.path.join(frigate_dir, 'docker-compose.yml')):
-        os.remove(os.path.join(frigate_dir, 'docker-compose.yml'))
-    return jsonify({'success': True})
-
-@app.route('/api/frigate/deploy/log')
-@login_required
-def frigate_deploy_log_api():
-    idx = request.args.get('index', 0, type=int)
-    return jsonify({'entries': frigate_deploy_log[idx:], 'total': len(frigate_deploy_log),
-        'running': frigate_deploy_status['running'], 'complete': frigate_deploy_status['complete'],
-        'error': frigate_deploy_status['error']})
-
-def run_frigate_deploy():
-    def plog(msg):
-        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
-        frigate_deploy_log.append(entry)
-        print(entry, flush=True)
-    try:
-        frigate_dir = os.path.expanduser('~/frigate')
-        os.makedirs(frigate_dir, exist_ok=True)
-        compose_content = """
-services:
-  frigate:
-    container_name: frigate
-    privileged: true
-    restart: unless-stopped
-    image: ghcr.io/blakeblackshear/frigate:stable
-    shm_size: "64mb"
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-      - ./config.yml:/config/config.yml
-      - ./storage:/media/frigate
-      - type: tmpfs
-        target: /tmp/cache
-        tmpfs:
-          size: 1000000000
-    ports:
-      - "5000:5000"
-      - "8554:8554"
-      - "8555:8555"
-    environment:
-      FRIGATE_RTSP_PASSWORD: "password"
-"""
-        with open(os.path.join(frigate_dir, 'docker-compose.yml'), 'w') as f:
-            f.write(compose_content.strip())
-        
-        settings = load_settings()
-        server_ip = settings.get('server_ip', '127.0.0.1')
-        config_content = """
-mqtt:
-  enabled: False
-cameras:
-  uas_1:
-    ffmpeg:
-      inputs:
-        - path: rtsp://{ip}:8554/uas_1
-          roles:
-            - detect
-    detect:
-      enabled: True
-      width: 1280
-      height: 720
-""".format(ip=server_ip)
-        with open(os.path.join(frigate_dir, 'config.yml'), 'w') as f:
-            f.write(config_content.strip())
-        
-        plog("Starting Frigate container...")
-        subprocess.run(f'cd {frigate_dir} && docker compose up -d', shell=True, capture_output=True, text=True, timeout=300)
-        plog("Frigate deployed successfully!")
-        frigate_deploy_status.update({'running': False, 'complete': True, 'error': False})
-    except Exception as e:
-        plog(f"Error during deployment: {e}")
-        frigate_deploy_status.update({'running': False, 'error': True})
 
 # === Main Entry Point (fallback for direct python3 app.py) ===
 if __name__ == '__main__':
