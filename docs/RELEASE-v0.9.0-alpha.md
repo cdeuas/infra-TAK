@@ -2,94 +2,185 @@
 
 ## What ships
 
-Two operator-facing features: custom identification banners and fail2ban brute-force IP blocking.
+Two operator-facing features: **Custom Identification Banners** and **Fail2ban Brute-Force Protection**.
 
 ---
 
-### Feature 1 — Custom Identification Banner
+## Feature 1 — Custom Identification Banner
 
-Operators managing multiple infra-TAK instances now have a persistent identity banner at the top of every page. It shows agency-provided free-form text centered between two logo marks, making it impossible to confuse which box you are on.
+Operators managing multiple infra-TAK instances now have a persistent identity banner at the top of every page. It eliminates the "which box am I on?" problem when managing a fleet.
+
+### What it looks like
 
 ```
 [ Agency Logo ]   REGION 5 OPS CENTER — ALPHA UNIT   [ Agency Logo ]
+                  190.102.110.224 | test6.takworx.com
 ```
 
-**How it works:**
-- The banner is `position:fixed` at the top of every page and is injected via the shared context processor — no individual page templates touched.
-- If no agency logo is uploaded, the infra-TAK text mark appears on both sides.
-- Configured at `/customization` (new page in sidebar, between Marketplace and Help).
+The banner is fixed to the top of every page — Console, Fail2ban, Caddy, TAK Server, all of them — and updates live without a page reload after saving.
 
-**New settings keys in `settings.json` (`customization` dict):**
-- `banner_enabled` — bool
-- `banner_text` — string, max 120 chars
-- `agency_logo_b64` — base64 data URI (PNG/SVG/JPEG, max 512 KB), nullable
+### How to set it up
 
-**New routes:**
-- `GET /customization` — Customization page
-- `GET /api/customization/settings` — read current config (no logo bytes)
-- `POST /api/customization/settings` — save `banner_enabled` + `banner_text`
-- `POST /api/customization/logo` — upload agency logo (multipart)
-- `DELETE /api/customization/logo` — remove agency logo
+1. Open the sidebar → **Customization** (between Marketplace and Help)
+2. Toggle **Enable Banner** on
+3. Type your identification text (agency name, unit, server role — up to 120 characters)
+4. Choose a **font size**: Small, Medium, or Large
+5. Upload an **agency logo** (PNG, SVG, or JPEG — max 512 KB) — appears on both sides of the text
+6. Click **Save** — banner appears immediately on all pages
+
+The public IP and FQDN of the server are always shown in small text beneath the banner text, regardless of custom text or logo.
+
+If no agency logo is uploaded, the infra-TAK mark appears on both sides instead.
+
+### Settings stored
+
+Under `customization` in `.config/settings.json`:
+
+| Key | Description |
+|-----|-------------|
+| `banner_enabled` | bool — whether banner renders |
+| `banner_text` | string — the identification text |
+| `banner_font_size` | `small` / `medium` / `large` |
+| `banner_text_color` | hex color (default `#00d4ff`) |
+| `agency_logo_b64` | base64 data URI of uploaded logo, or null |
 
 ---
 
-### Feature 2 — Fail2ban Brute-Force Protection
+## Feature 2 — Fail2ban Brute-Force Protection (Marketplace Module)
 
-Authentik login failures now trigger automatic IP bans via fail2ban + UFW. This is the host-level brute-force control that was explicitly parked in v0.8.9 pending the trusted-proxy CIDR prerequisite fix.
+Fail2ban is a host-level intrusion prevention system. When an IP address repeatedly fails authentication, Fail2ban bans it at the firewall level via UFW — no more brute-force attempts, no more log noise.
 
-**Architecture:**
+infra-TAK ships two optional jails: one for **Authentik** login failures and one for **TAK Server** connection probes. Both are operator-controlled with enable/disable toggles, configurable thresholds, IP whitelists, and Guard Dog email alerts on every ban.
+
+### Installing Fail2ban
+
+1. Open the sidebar → **Fail2ban**
+2. Click **Install Fail2ban** in the Marketplace card
+3. Watch the progress log — it installs the package, writes filters, configures UFW actions, and sets up the log forwarder for Authentik
+4. After install, the page reloads showing the dashboard
+
+> **Prerequisite:** Fail2ban requires the v0.8.9 Authentik trusted-proxy CIDR fix to be applied before it will install. This is confirmed automatically. Installs without the fix will see an error message.
+
+---
+
+### Authentik Jail
+
+Monitors `/var/log/authentik/auth.log` for `login_failed` events and bans the source IP after too many failures.
+
+#### How it works
+
 ```
 Browser → Caddy → Authentik → docker logs → log-forwarder → /var/log/authentik/auth.log
                                                                       ↓
-                                                fail2ban filter (login_failed JSON) → ufw ban
+                                              fail2ban filter (login_failed JSON) → UFW ban
 ```
 
-**What the migration does (`_fail2ban_install_and_configure`):**
-1. Guards: requires `authentik_trusted_proxy_cidrs_fix.last_outcome` ∈ `{applied, idempotent-noop}` — will NOT install if v0.8.9 prerequisite not confirmed. Skips silently on non-Authentik installs.
-2. Installs `fail2ban` via `apt-get` (or `yum` on non-Debian).
-3. Creates `/var/log/authentik/` directory.
-4. Writes `/etc/systemd/system/authentik-log-forwarder.service` — tails `docker logs -f authentik-server-1` to the log file.
-5. Writes `/etc/fail2ban/filter.d/authentik.conf` — regex matching `login_failed` JSON lines.
-6. Writes `/etc/fail2ban/jail.d/infratak-authentik.conf` — default thresholds: 5 failures in 600s → 3600s ban, action: ufw.
-7. Enables and starts both services.
-8. Records `last_outcome: applied` to `settings.fail2ban_setup`.
+The **authentik-log-forwarder** is a systemd service that tails `docker logs -f authentik-server-1` to a host-accessible log file. Fail2ban watches that file.
 
-**Idempotent:** re-running on an already-configured install is a sub-second no-op.
+#### Dashboard
 
-**Default thresholds (configurable in the UI):**
-- `maxretry`: 5 failed logins
-- `findtime`: 600 seconds (10-minute window)
-- `bantime`: 3600 seconds (1 hour)
+The **Authentik Jail** card shows:
+- **Enable toggle** — turns the jail on or off (also starts/stops the log forwarder)
+- **Active/Disabled badge** with pulsing dot when live
+- **Currently Banned** — IPs blocked right now, with Unban buttons
+- **Currently Failed** — IPs accumulating failures (not yet banned)
+- **Session totals** — total bans and failures since fail2ban last started
 
-**New UI page (`/fail2ban`):**
-- Appears in the sidebar between Firewall and Guard Dog (only shown when fail2ban is installed)
-- **Stats** — currently banned, currently failed, session totals
-- **Currently Banned IPs** — table with Unban button per IP
-- **Jail Configuration** — maxretry/findtime/bantime inputs, Save & Reload
-- **Activity Log** — last 100 authentik events from `/var/log/fail2ban.log`, auto-refreshes every 30s
+#### Configuration
 
-**New routes:**
-- `GET /fail2ban` — Fail2ban dashboard
-- `GET /api/fail2ban/status` — jail status + banned IP list + log forwarder health
-- `POST /api/fail2ban/config` — update thresholds + `fail2ban-client reload`
-- `POST /api/fail2ban/unban` — `fail2ban-client set authentik unbanip <ip>` (validates IP format)
-- `GET /api/fail2ban/log` — last 100 authentik lines from `/var/log/fail2ban.log`
+| Field | Default | Description |
+|-------|---------|-------------|
+| Max Retries | 5 | Failed logins before ban |
+| Find Window | 10 min | Time window to count failures |
+| Ban Duration | 60 min | How long the ban lasts |
+| Whitelist | _(empty)_ | Space-separated IPs / CIDRs that are never banned. Localhost is always exempt. |
+
+Click **Save & Reload** to apply — active bans are not affected.
+
+#### Guard Dog email alerts
+
+When an IP is auto-banned, an email is sent to your configured Guard Dog alert address:
+
+```
+Subject: [YOUR-SERVER-NICKNAME] fail2ban: Banned 1.2.3.4 (Authentik)
+
+fail2ban has banned the following IP address:
+
+  IP:     1.2.3.4
+  Jail:   Authentik
+  Server: YOUR-SERVER-NICKNAME
+  Time:   2026-05-02 01:23:45 UTC
+  Reason: Too many failed Authentik login attempts
+
+To unban this IP, open your infra-TAK console → Fail2ban page.
+```
+
+The server nickname is pulled from your Console settings. Requires Guard Dog email relay to be configured.
+
+#### Log Forwarder
+
+The top-right badge shows **Log Forwarder Active** (green) or **Log Forwarder Stopped** (red).
+
+If the forwarder is stopped after install (common on servers where Fail2ban was installed before this feature):
+1. Toggle the Authentik Jail **OFF** then back **ON**
+2. The toggle re-writes the service file if missing and starts it automatically
 
 ---
 
-## Changes shipped
+### TAK Server Jail
 
-### `app.py`
+Monitors `/opt/tak/logs/takserver-messaging.log` for repeated TLS handshake failures (bots probing your TAK Server without valid certificates).
 
-- **VERSION**: `0.8.9-alpha` → `0.9.0-alpha`
-- **New `render_custom_banner(settings)`** — returns `position:fixed` banner HTML + style injection; empty string when disabled. Prepended to `sidebar_html` in the context processor — zero template changes.
-- **Context processor extended** — calls `render_custom_banner()` and prepends result to `sidebar_html`.
-- **New `render_sidebar()` entry** — Customization link after Marketplace; Fail2ban link between Firewall and Guard Dog (conditional on `/etc/fail2ban` existing).
-- **New `_fail2ban_install_and_configure(plog)`** — idempotent migration, wired into `_startup_migrations` and `_post_update_auto_deploy` after the v0.8.9 block.
-- **New customization routes** — `/customization`, `/api/customization/settings` (GET/POST), `/api/customization/logo` (POST/DELETE).
-- **New fail2ban routes** — `/fail2ban`, `/api/fail2ban/status`, `/api/fail2ban/config`, `/api/fail2ban/unban`, `/api/fail2ban/log`.
-- **New `CUSTOMIZATION_TEMPLATE`** — full-page template with banner preview, toggle, text input, logo upload/remove.
-- **New `FAIL2BAN_TEMPLATE`** — security dashboard with stats, banned-IP table, config sliders, activity log.
+#### Why this matters
+
+Internet bots constantly probe open ports. TAK Server on port 8089 gets hit by scanners trying TLS connections without certs. These aren't dangerous (no cert = no access) but they create log noise and consume resources. The TAK Server jail bans the source IPs.
+
+#### Dashboard
+
+The **TAK Server Jail** card shows the same layout as Authentik:
+- **Enable toggle** + **Active/Disabled badge**
+- **Currently Banned** + **Currently Failed** + session totals
+- **Currently Failed is clickable** — expands a panel showing every IP currently accumulating failures with a **Ban Now** button to manually ban before the threshold is reached
+- **Refresh button** — spins and reloads stats on demand
+
+#### Configuration
+
+Same fields as Authentik (Max Retries, Find Window, Ban Duration, Whitelist) plus a manual ban field in the watching panel.
+
+#### Guard Dog email alerts
+
+Same format as Authentik with jail label `TAK Server`:
+
+```
+Subject: [YOUR-SERVER-NICKNAME] fail2ban: Banned 1.2.3.4 (TAK Server)
+```
+
+---
+
+### Uninstalling Fail2ban
+
+Open **Fail2ban** in the sidebar, scroll to the bottom, click **Uninstall Fail2ban**. This removes:
+- The `fail2ban` package
+- Both jail configs
+- The log forwarder service
+- The Guard Dog action hooks
+
+---
+
+## Architecture summary
+
+| Component | Path |
+|-----------|------|
+| Authentik filter | `/etc/fail2ban/filter.d/authentik.conf` |
+| TAK Server filter | `/etc/fail2ban/filter.d/takserver.conf` |
+| Authentik jail | `/etc/fail2ban/jail.d/infratak-authentik.conf` |
+| TAK Server jail | `/etc/fail2ban/jail.d/infratak-takserver.conf` |
+| Guard Dog action (Authentik) | `/etc/fail2ban/action.d/infratak-guarddog.conf` |
+| Guard Dog action (TAK Server) | `/etc/fail2ban/action.d/infratak-guarddog-takserver.conf` |
+| Email alert script | `/usr/local/sbin/infratak-f2b-notify` |
+| Log forwarder service | `/etc/systemd/system/authentik-log-forwarder.service` |
+| Authentik log | `/var/log/authentik/auth.log` |
+| Guard Dog ban log | `/var/log/takguard/restarts.log` |
 
 ---
 
@@ -98,48 +189,44 @@ Browser → Caddy → Authentik → docker logs → log-forwarder → /var/log/a
 ### Banner
 
 ```bash
-# 1. Navigate to /customization, enable banner, set text, save
-# 2. Reload any page — banner appears fixed at the top
-# 3. Upload agency PNG — both sides update to agency logo
-# 4. Verify settings
-sudo cat /root/infra-TAK/.config/settings.json | python3 -c "
-import json, sys; d = json.load(sys.stdin)
-print('customization:', json.dumps(d.get('customization', {}), indent=2))"
+# After saving banner settings, verify config is stored
+python3 -c "
+import json
+d = json.load(open('/root/infra-TAK/.config/settings.json'))
+print(json.dumps(d.get('customization', {}), indent=2))
+"
 ```
 
-Expected: `customization.banner_enabled: true`, `customization.banner_text: <your text>`
+Expected: `banner_enabled: true`, `banner_text` contains your text.
 
 ### Fail2ban
 
 ```bash
-# 1. Confirm v0.8.9 prerequisite is met
-sudo cat /root/infra-TAK/.config/settings.json | python3 -c "
-import json, sys; d = json.load(sys.stdin)
-print('proxy fix:', d.get('authentik_trusted_proxy_cidrs_fix', {}).get('last_outcome'))"
+# Confirm fail2ban is installed and running
+systemctl status fail2ban
 
-# 2. Confirm fail2ban migration outcome
-sudo cat /root/infra-TAK/.config/settings.json | python3 -c "
-import json, sys; d = json.load(sys.stdin)
-print('fail2ban_setup:', json.dumps(d.get('fail2ban_setup', {}), indent=2))"
+# Confirm Authentik jail is active
+fail2ban-client status authentik
 
-# 3. Confirm jail is active
-sudo fail2ban-client status authentik
+# Confirm log forwarder is running
+systemctl status authentik-log-forwarder
 
-# 4. Confirm log forwarder is running
-sudo systemctl status authentik-log-forwarder
+# Confirm auth.log is being written
+tail -5 /var/log/authentik/auth.log
 
-# 5. Confirm auth.log is being populated
-sudo tail -f /var/log/authentik/auth.log
+# Test a ban manually (triggers email)
+echo '{"action": "login_failed", "client_ip": "10.99.99.99", "timestamp": "2026-05-02T01:00:00Z"}' \
+  >> /var/log/authentik/auth.log
+# Repeat 5x, then check:
+fail2ban-client status authentik
 ```
-
-Expected: `fail2ban_setup.last_outcome: "applied"`, jail status shows `authentik` jail enabled.
 
 ---
 
 ## What was explicitly NOT shipped
 
-- **Authentik Reputation policy** — deferred to v0.9.1. fail2ban handles the immediate brute-force need at the host level. Reputation policy adds flow-level blocking within Authentik and requires blueprint diff + healing migration.
-- **SSH fail2ban jail** — only Authentik login events in v0.9.0. SSH hardening is a separate planning item.
+- **Authentik Reputation policy** — deferred to v0.9.1. Fail2ban handles host-level brute-force. Reputation policy adds flow-level blocking within Authentik itself.
+- **SSH jail** — only Authentik and TAK Server in v0.9.0. SSH hardening is a separate planning item.
 - **TAK Server rollback** — parked since v0.8.8, still deferred.
 - **Node-RED flow changes** — not in scope.
 
@@ -147,7 +234,8 @@ Expected: `fail2ban_setup.last_outcome: "applied"`, jail status shows `authentik
 
 ## Cardinal rules upheld
 
-- **Idempotent migrations.** Both `_fail2ban_install_and_configure` and the banner storage are safe to re-run; they no-op if already applied.
-- **Prerequisite-gated.** fail2ban install is blocked if `authentik_trusted_proxy_cidrs_fix` is not confirmed. This prevents the v0.8.9 DoS scenario (banning `172.18.0.1`) on unpatched installs.
-- **No template surgery.** Banner injection uses the existing context processor pattern — one change, all pages covered.
-- **Audit trail in `settings.json`.** `fail2ban_setup` and `customization` keys record all config for every box.
+- **Idempotent install.** Running `_fail2ban_install_and_configure` on an already-configured box is a sub-second no-op.
+- **Prerequisite-gated.** Fail2ban install is blocked if the v0.8.9 trusted-proxy CIDR fix is not confirmed — prevents banning `172.18.0.1` on unpatched installs.
+- **Self-healing service file.** If the log forwarder service file is missing (older installs), toggling the Authentik jail ON re-writes it automatically.
+- **No template surgery.** Banner injection uses the existing context processor — one change, all pages covered.
+- **Audit trail.** `fail2ban_setup` and `customization` keys in `settings.json` record all config for every box.
