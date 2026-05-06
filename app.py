@@ -1,3 +1,13 @@
+import sys
+_original_print = print
+def print(*args, **kwargs):
+    try:
+        _original_print(*args, **kwargs)
+    except OSError as e:
+        if e.errno == 9: # Bad file descriptor
+            pass
+        else:
+            raise
 #!/usr/bin/env python3
 """infra-TAK v0.2.4 - TAK Infrastructure Platform"""
 
@@ -660,6 +670,12 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+
+def _find_module_dir(name):
+    for c in [f'/root/{name}', f'/home/sauron/{name}', os.path.expanduser(f'~/{name}')]:
+        if os.path.exists(c): return c
+    return os.path.expanduser(f'~/{name}')
+
 def detect_modules():
     modules = {}
     settings = load_settings()
@@ -704,14 +720,14 @@ def detect_modules():
         ok, out = _ssh_probe(ak_cfg.get('remote', {}), 'docker ps --filter name=authentik-server --format "{{.Status}}"', timeout=12)
         ak_running = bool(ok and out and 'Up' in out)
     else:
-        ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
+        ak_installed = os.path.exists(os.path.join(_find_module_dir('authentik'), 'docker-compose.yml'))
         if ak_installed:
             r = subprocess.run('docker ps --filter name=authentik-server --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
             ak_running = 'Up' in r.stdout
     modules['authentik'] = {'name': 'Authentik', 'installed': ak_installed, 'running': ak_running,
         'description': 'Identity provider — SSO, LDAP, user management', 'icon': '🔐', 'icon_url': AUTHENTIK_LOGO_URL, 'route': '/authentik', 'priority': 2}
     # TAK Portal - Docker-based user management (local only; stays with TAK Server)
-    portal_installed = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
+    portal_installed = os.path.exists(os.path.join(_find_module_dir('TAK-Portal'), 'docker-compose.yml'))
     portal_running = False
     if portal_installed:
         r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
@@ -750,7 +766,7 @@ def detect_modules():
         ok, out = _ssh_probe(nodered_cfg.get('remote', {}), 'docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', timeout=12)
         nodered_running = bool(ok and out and 'Up' in out)
     else:
-        nr_dir = os.path.expanduser('~/node-red')
+        nr_dir = _find_module_dir('node-red')
         nr_compose = os.path.join(nr_dir, 'docker-compose.yml')
         if os.path.exists(nr_compose):
             nodered_installed = True
@@ -758,14 +774,14 @@ def detect_modules():
             if r.returncode == 0 and (r.stdout or '').strip():
                 r2 = subprocess.run('docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
                 nodered_running = bool(r2.stdout and 'Up' in r2.stdout)
-        if not nodered_installed and (os.path.exists(os.path.expanduser('~/node-red')) or os.path.exists('/opt/nodered')):
+        if not nodered_installed and (os.path.exists(_find_module_dir('node-red')) or os.path.exists('/opt/nodered')):
             nodered_installed = True
             r = subprocess.run(['systemctl', 'is-active', 'nodered'], capture_output=True, text=True)
             if r.stdout.strip() == 'active':
                 nodered_running = True
     
     # n8n Tactical Automation
-    n8n_dir = os.path.expanduser("~/n8n-tactical")
+    n8n_dir = '/home/sauron/n8n-tactical'
     n8n_installed = os.path.exists(os.path.join(n8n_dir, "docker-compose.yml"))
     n8n_running = False
     if n8n_installed:
@@ -776,7 +792,7 @@ def detect_modules():
     modules['nodered'] = {'name': 'Node-RED', 'installed': nodered_installed, 'running': nodered_running,
         'description': 'Flow-based automation & integrations', 'icon': '🔴', 'icon_url': NODERED_LOGO_URL_2, 'route': '/nodered', 'priority': 6}
     # Frigate NVR
-    frigate_installed = os.path.exists(os.path.expanduser("~/frigate/docker-compose.yml"))
+    frigate_installed = os.path.exists(os.path.join(_find_module_dir('frigate'), 'docker-compose.yml'))
     frigate_running = False
     if frigate_installed:
         r = subprocess.run('docker ps --filter name=frigate --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
@@ -784,7 +800,7 @@ def detect_modules():
     modules['frigate'] = {'name': 'Frigate NVR', 'installed': frigate_installed, 'running': frigate_running,
         'description': 'AI-powered NVR with object detection', 'icon': 'videocam', 'icon_url': FRIGATE_LOGO_URL, 'route': '/frigate', 'priority': 6.5}
     # CloudTAK (local or remote deployment target)
-    cloudtak_dir = os.path.expanduser('~/CloudTAK')
+    cloudtak_dir = _find_module_dir('CloudTAK')
     cloudtak_cfg = _get_cloudtak_deployment_config(settings)
     cloudtak_installed = False
     cloudtak_running = False
@@ -5204,9 +5220,9 @@ def run_guarddog_deploy(alert_email):
         script_files.append('tak-db-repack.sh')
         script_files.append('tak-retention-guard.sh')
         # Optional: monitors for other services (only install if that service is present)
-        ak_dir = os.path.expanduser('~/authentik')
-        nr_dir = os.path.expanduser('~/node-red')
-        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+        ak_dir = _find_module_dir('authentik')
+        nr_dir = _find_module_dir('node-red')
+        cloudtak_dir = _find_module_dir('CloudTAK')
         if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
             script_files.append('tak-authentik-watch.sh')
         if os.path.exists('/usr/local/bin/mediamtx') and os.path.exists('/usr/local/etc/mediamtx.yml'):
@@ -5215,7 +5231,7 @@ def run_guarddog_deploy(alert_email):
             script_files.append('tak-nodered-watch.sh')
         if os.path.exists(cloudtak_dir) and os.path.exists(os.path.join(cloudtak_dir, 'docker-compose.yml')):
             script_files.append('tak-cloudtak-watch.sh')
-        portal_dir = os.path.expanduser('~/TAK-Portal')
+        portal_dir = _find_module_dir('TAK-Portal')
         if os.path.exists(os.path.join(portal_dir, 'docker-compose.yml')):
             script_files.append('tak-takportal-watch.sh')
         fh_cfg = _get_fedhub_deployment_config(settings)
@@ -8254,7 +8270,7 @@ def _patch_takportal_compose_network():
     This makes the network survive 'docker compose down && up' from the CLI,
     not just console-driven restarts.
     """
-    compose_path = os.path.expanduser('~/TAK-Portal/docker-compose.yml')
+    compose_path = os.path.exists(os.path.join(_find_module_dir('TAK-Portal'), 'docker-compose.yml'))
     if not os.path.exists(compose_path):
         return False
     try:
@@ -8296,7 +8312,7 @@ def _patch_authentik_compose_network():
     'docker compose down && up' or Docker-initiated restarts — not just
     console-driven restarts that call _ensure_infratak_network_for_authentik().
     """
-    compose_path = os.path.expanduser('~/authentik/docker-compose.yml')
+    compose_path = os.path.exists(os.path.join(_find_module_dir('authentik'), 'docker-compose.yml'))
     if not os.path.exists(compose_path):
         return False
     try:
@@ -8359,7 +8375,8 @@ def _get_authentik_env_content(settings):
         if ok and out and out.strip():
             return out.strip()
         return None
-    path = os.path.expanduser('~/authentik/.env')
+    ak_dir = _find_module_dir("authentik")
+    path = os.path.join(ak_dir, ".env")
     if not os.path.isfile(path):
         return None
     try:
@@ -9558,7 +9575,7 @@ def _get_takportal_version_info():
     """Return {version: str, update_available: bool, latest: str|None} for TAK Portal.
     Version from package.json; update status from container logs [update-check] line."""
     import re
-    portal_dir = os.path.expanduser('~/TAK-Portal')
+    portal_dir = _find_module_dir('TAK-Portal')
     out = {'version': '', 'update_available': False, 'latest': None}
     # Prefer package.json version (semantic version)
     pkg_path = os.path.join(portal_dir, 'package.json')
@@ -9686,7 +9703,7 @@ def _get_authentik_version_info():
     """Return {version: str, update_available: bool, latest: str|None} for Authentik."""
     out = {'version': '', 'update_available': False, 'latest': None}
     import re
-    ak_dir = os.path.expanduser('~/authentik')
+    ak_dir = _find_module_dir('authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     if os.path.isfile(compose_path):
         try:
@@ -9785,7 +9802,7 @@ def _get_cloudtak_version_info():
     """Return {version: str, update_available: bool, latest: str|None} for CloudTAK."""
     import re
     out = {'version': '', 'update_available': False, 'latest': None}
-    ct_dir = os.path.expanduser('~/CloudTAK')
+    ct_dir = _find_module_dir('CloudTAK')
     for pkg in ['package.json', 'api/package.json', 'web/package.json']:
         pkg_path = os.path.join(ct_dir, pkg)
         if os.path.isfile(pkg_path):
@@ -10015,7 +10032,7 @@ def takportal_page():
             container_info['status'] = containers[0]['status'] if containers else ''
     # Get portal port from .env if exists
     portal_port = '3000'
-    env_path = os.path.expanduser('~/TAK-Portal/.env')
+    env_path = os.path.join(_find_module_dir('TAK-Portal'), '.env')
     if os.path.exists(env_path):
         with open(env_path) as f:
             for line in f:
@@ -10145,7 +10162,7 @@ def _takportal_setup_ssh(log_fn=None):
         if log_fn:
             log_fn("  ⏭ TAK Server not on this host — skipping SSH auto-config (configure manually in TAK Portal)")
         return False
-    key_dir = os.path.expanduser('~/TAK-Portal/data/ssh')
+    key_dir = os.path.join(_find_module_dir('TAK-Portal'), 'data/ssh')
     priv_key = os.path.join(key_dir, 'tak_ssh_ed25519')
     pub_key = priv_key + '.pub'
     auth_keys = os.path.expanduser('~/.ssh/authorized_keys')
@@ -10246,7 +10263,7 @@ def _takportal_build_settings_json(settings):
 @login_required
 def takportal_control():
     action = request.json.get('action')
-    portal_dir = os.path.expanduser('~/TAK-Portal')
+    portal_dir = _find_module_dir('TAK-Portal')
     if action == 'start':
         _patch_takportal_compose_network()
         subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=120)
@@ -10383,7 +10400,7 @@ def takportal_uninstall():
     auth = load_auth()
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
         return jsonify({'error': 'Invalid admin password'}), 403
-    portal_dir = os.path.expanduser('~/TAK-Portal')
+    portal_dir = _find_module_dir('TAK-Portal')
     steps = []
     subprocess.run(f'cd {portal_dir} && docker compose down -v --rmi local 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
     steps.append('Stopped and removed Docker containers/volumes')
@@ -10435,7 +10452,7 @@ def run_takportal_deploy():
         takportal_deploy_log.append(entry)
         print(entry, flush=True)
     try:
-        portal_dir = os.path.expanduser('~/TAK-Portal')
+        portal_dir = _find_module_dir('TAK-Portal')
         settings = load_settings()
         if settings.get('pkg_mgr', 'apt') == 'apt':
             wait_for_apt_lock(plog, takportal_deploy_log)
@@ -11367,7 +11384,7 @@ paths:
             pass
         plog("✓ HLS URLs patched for HTTPS proxy")
     # LDAP overlay: when Authentik is present locally, patch remote editor for header auth
-    ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
+    ak_installed = os.path.exists(os.path.join(_find_module_dir('authentik'), 'docker-compose.yml'))
     ldap_env_lines = ''
     if ak_installed:
         overlay_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
@@ -11428,7 +11445,7 @@ paths:
         else:
             plog("⚠ mediamtx_ldap_overlay.py not found — LDAP overlay skipped")
         ak_token_val = ''
-        ak_env_path = os.path.expanduser('~/authentik/.env')
+        ak_env_path = os.path.join(_find_module_dir('authentik'), '.env')
         if os.path.exists(ak_env_path):
             with open(ak_env_path) as _f:
                 for _line in _f:
@@ -11567,7 +11584,7 @@ paths:
         plog("  No domain configured — skipping SSL (RTSP unencrypted only)")
 
     # Register MediaMTX proxy provider + application in Authentik (if running)
-    ak_dir = os.path.expanduser('~/authentik')
+    ak_dir = _find_module_dir('authentik')
     ak_env_path = os.path.join(ak_dir, '.env')
     if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')) and os.path.exists(ak_env_path):
         _ak_token = ''
@@ -11984,7 +12001,7 @@ WantedBy=multi-user.target
         # Web editor systemd service — add LDAP env vars when Authentik is present
         ldap_env_lines = ''
         if ldap_available:
-            ak_env_path = os.path.expanduser('~/authentik/.env')
+            ak_env_path = os.path.join(_find_module_dir('authentik'), '.env')
             ak_token_val = ''
             if os.path.exists(ak_env_path):
                 with open(ak_env_path) as _f:
@@ -12119,7 +12136,7 @@ WantedBy=multi-user.target
         r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True)
         if r.stdout.strip() == 'active':
             # If Authentik is running, ensure stream visibility groups exist (video-public, video-private, video-admin)
-            ak_dir = os.path.expanduser('~/authentik')
+            ak_dir = _find_module_dir('authentik')
             env_path = os.path.join(ak_dir, '.env')
             if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')) and os.path.exists(env_path):
                 ak_token = ''
@@ -12715,7 +12732,7 @@ def cloudtak_control():
         ok, out = _ssh_probe(rcfg, "docker ps --filter name=cloudtak-api --format '{{.Status}}' 2>/dev/null", timeout=10)
         running = bool(ok and out and 'Up' in out)
     else:
-        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+        cloudtak_dir = _find_module_dir('CloudTAK')
         if action == 'start':
             subprocess.run(f'cd {cloudtak_dir} && docker compose up -d 2>&1', shell=True, capture_output=True, timeout=60)
         elif action == 'stop':
@@ -12754,7 +12771,7 @@ def cloudtak_container_logs():
         if not ok and not entries:
             entries = ['Could not fetch remote logs']
         return jsonify({'entries': entries})
-    cloudtak_dir = os.path.expanduser('~/CloudTAK')
+    cloudtak_dir = _find_module_dir('CloudTAK')
     compose_yml = os.path.join(cloudtak_dir, 'docker-compose.yml')
     if not os.path.exists(compose_yml):
         compose_yml = os.path.join(cloudtak_dir, 'compose.yaml')
@@ -12815,7 +12832,7 @@ def cloudtak_uninstall():
                     cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': f'Remote uninstall failed on {rhost}: {(out or "unknown error")[:240]}'})
                     return
             else:
-                cloudtak_dir = os.path.expanduser('~/CloudTAK')
+                cloudtak_dir = _find_module_dir('CloudTAK')
                 compose_yml = os.path.join(cloudtak_dir, 'docker-compose.yml')
                 compose_yaml = os.path.join(cloudtak_dir, 'compose.yaml')
                 if os.path.exists(cloudtak_dir):
@@ -12952,7 +12969,7 @@ def run_cloudtak_deploy(cfg=None):
     try:
         settings = load_settings()
         cfg = cfg or _get_cloudtak_deployment_config(settings)
-        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+        cloudtak_dir = _find_module_dir('CloudTAK')
         domain = settings.get('fqdn', '')
         target_mode = (cfg.get('target_mode') or 'local').strip().lower()
 
@@ -13488,7 +13505,7 @@ def run_cloudtak_redeploy(cfg=None):
             plog("✓ Update config & restart done (remote)")
             cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
             return
-        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+        cloudtak_dir = _find_module_dir('CloudTAK')
         compose_yml = os.path.join(cloudtak_dir, 'docker-compose.yml')
         if not os.path.exists(compose_yml):
             compose_yml = os.path.join(cloudtak_dir, 'compose.yaml')
@@ -13619,7 +13636,7 @@ def run_cloudtak_update():
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         else:
-            cloudtak_dir = os.path.expanduser('~/CloudTAK')
+            cloudtak_dir = _find_module_dir('CloudTAK')
             if not os.path.isdir(os.path.join(cloudtak_dir, '.git')):
                 plog("✗ ~/CloudTAK not found — use Deploy instead")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -13643,7 +13660,7 @@ def run_cloudtak_update():
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         else:
-            cloudtak_dir = os.path.expanduser('~/CloudTAK')
+            cloudtak_dir = _find_module_dir('CloudTAK')
             r = subprocess.run(
                 'docker compose build --no-cache && docker compose up -d 2>&1',
                 shell=True, capture_output=True, text=True, timeout=2700, cwd=cloudtak_dir)
@@ -13810,7 +13827,7 @@ smtp_generic_maps = hash:/etc/postfix/generic
         plog(f"   From:     {from_name} <{from_addr}>")
 
         # Auto-configure Authentik if installed (SMTP + recovery flow)
-        ak_dir = os.path.expanduser('~/authentik')
+        ak_dir = _find_module_dir('authentik')
         if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
             plog("")
             plog("🔑 Step 6/6 — Configuring Authentik (SMTP + password recovery)...")
@@ -13834,7 +13851,7 @@ smtp_generic_maps = hash:/etc/postfix/generic
 
 def _authentik_smtp_configured():
     """True if Authentik .env has email settings (SMTP was pushed by Configure Authentik or deploy)."""
-    env_path = os.path.expanduser('~/authentik/.env')
+    env_path = os.path.join(_find_module_dir('authentik'), '.env')
     if not os.path.exists(env_path):
         return False
     with open(env_path) as f:
@@ -13986,7 +14003,7 @@ def _configure_authentik_smtp_and_recovery(from_addr, plog=None):
     Used by both the Email Relay deploy and the 'Configure Authentik' button.
     Returns a status message string. Raises on fatal error."""
     import re as _re
-    ak_dir = os.path.expanduser('~/authentik')
+    ak_dir = _find_module_dir('authentik')
     env_path = os.path.join(ak_dir, '.env')
     smtp_host = 'host.docker.internal'
     _from = (from_addr or '').strip() or 'authentik@localhost'
@@ -14405,7 +14422,7 @@ def emailrelay_configure_authentik():
     relay = settings.get('email_relay') or {}
     if not relay.get('from_addr'):
         return jsonify({'success': False, 'error': 'Email Relay not configured. Deploy the relay first.'}), 400
-    ak_dir = os.path.expanduser('~/authentik')
+    ak_dir = _find_module_dir('authentik')
     if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
         return jsonify({'success': False, 'error': 'Authentik is not installed.'}), 400
     try:
@@ -14604,7 +14621,7 @@ def nodered_deploy_log_api():
 @login_required
 def nodered_control():
     action = (request.json or {}).get('action', '')
-    nr_dir = os.path.expanduser('~/node-red')
+    nr_dir = _find_module_dir('node-red')
     compose = os.path.join(nr_dir, 'docker-compose.yml')
     if not os.path.exists(compose):
         return jsonify({'error': 'Node-RED not deployed here'}), 400
@@ -14625,7 +14642,7 @@ def nodered_control():
 @login_required
 def nodered_logs():
     lines = request.args.get('lines', 80, type=int)
-    nr_dir = os.path.expanduser('~/node-red')
+    nr_dir = _find_module_dir('node-red')
     compose = os.path.join(nr_dir, 'docker-compose.yml')
     if not os.path.exists(compose):
         return jsonify({'entries': []})
@@ -14670,7 +14687,7 @@ def nodered_uninstall():
             settings['nodered_deployment'] = _normalize_module_deployment_config(deploy_cfg)
             save_settings(settings)
         else:
-            nr_dir = os.path.expanduser('~/node-red')
+            nr_dir = _find_module_dir('node-red')
             compose = os.path.join(nr_dir, 'docker-compose.yml')
             if os.path.exists(compose):
                 subprocess.run(f'docker compose -f "{compose}" down -v 2>&1', shell=True, capture_output=True, timeout=60, cwd=nr_dir)
@@ -14696,15 +14713,15 @@ def _is_module_deployed(settings, module_key):
     if module_key == 'infratak':
         return True
     if module_key == 'takportal':
-        return os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
+        return os.path.exists(os.path.join(_find_module_dir('TAK-Portal'), 'docker-compose.yml'))
     if module_key == 'nodered':
         nr_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
         if nr_cfg.get('target_mode') == 'remote' and nr_cfg.get('deployed') and (nr_cfg.get('remote', {}).get('host') or '').strip():
             return True
-        nr_compose = os.path.join(os.path.expanduser('~/node-red'), 'docker-compose.yml')
+        nr_compose = os.path.join(_find_module_dir('node-red'), 'docker-compose.yml')
         if os.path.exists(nr_compose):
             return True
-        if os.path.exists(os.path.expanduser('~/node-red')) or os.path.exists('/opt/nodered'):
+        if os.path.exists(_find_module_dir('node-red')) or os.path.exists('/opt/nodered'):
             return True
         return False
     if module_key == 'mediamtx':
@@ -15857,7 +15874,7 @@ def run_nodered_deploy():
         if nodered_deploy_status.get('cancelled'):
             return
         domain = (settings.get('fqdn') or '').strip()
-        nr_dir = os.path.expanduser('~/node-red')
+        nr_dir = _find_module_dir('node-red')
         os.makedirs(nr_dir, exist_ok=True)
         plog("")
         plog("━━━ Step 1/3: Creating Docker Compose ━━━")
@@ -15947,11 +15964,11 @@ volumes:
             plog(f"✓ Caddy updated — open via https://nodered.{domain}")
         else:
             plog("  No domain configured — access via http://<server>:1880")
-        if not nodered_deploy_status.get('cancelled') and domain and os.path.exists(os.path.expanduser('~/authentik/.env')):
+        if not nodered_deploy_status.get('cancelled') and domain and os.path.exists(os.path.join(_find_module_dir('authentik'), '.env')):
             plog("")
             plog("━━━ Configuring Authentik for Node-RED ━━━")
             ak_token = ''
-            with open(os.path.expanduser('~/authentik/.env')) as f:
+            with open(os.path.join(_find_module_dir('authentik'), '.env')) as f:
                 for line in f:
                     if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
                         ak_token = line.strip().split('=', 1)[1].strip()
@@ -19802,7 +19819,7 @@ def authentik_page():
     container_info = {}
     ak_port = '9090'
     if ak.get('installed'):
-        env_path = os.path.expanduser('~/authentik/.env')
+        env_path = os.path.join(_find_module_dir('authentik'), '.env')
         if os.path.exists(env_path):
             with open(env_path) as f:
                 for line in f:
@@ -19879,7 +19896,7 @@ def authentik_control():
         ok, out = _ssh_probe(remote, 'docker ps --filter name=authentik-server --format "{{.Status}}"', timeout=10)
         running = bool(ok and out and 'Up' in out)
         return jsonify({'success': True, 'running': running, 'action': action})
-    ak_dir = os.path.expanduser('~/authentik')
+    ak_dir = _find_module_dir('authentik')
     _patch_authentik_compose_network()
     if action == 'start':
         subprocess.run(f'cd {ak_dir} && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
@@ -19931,7 +19948,7 @@ def _authentik_installed_for_reconfigure():
     deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
     if deploy_cfg.get('target_mode') == 'remote' and deploy_cfg.get('deployed') and (deploy_cfg.get('remote', {}).get('host') or '').strip():
         return True
-    if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+    if os.path.exists(os.path.join(_find_module_dir('authentik'), 'docker-compose.yml')):
         return True
     try:
         r = subprocess.run('docker ps --filter name=authentik-server --format "{{.Names}}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
@@ -20031,7 +20048,7 @@ def authentik_error_log():
 # Script run on remote host to fix LDAP outpost token (reads .env, calls localhost:9090, patches compose, restarts ldap)
 _AUTHENTIK_FIX_LDAP_REMOTE_SCRIPT = r'''
 import os, sys, json, urllib.request, urllib.error, subprocess, time
-os.chdir(os.path.expanduser("~/authentik"))
+os.chdir(_find_module_dir('authentik'))
 token = None
 if os.path.isfile(".env"):
     with open(".env") as f:
@@ -20100,7 +20117,7 @@ safe = key.replace("'", "''")
 content = content.replace("AUTHENTIK_TOKEN: placeholder", "AUTHENTIK_TOKEN: '" + safe + "'")
 with open("docker-compose.yml", "w") as f:
     f.write(content)
-subprocess.run("docker compose stop ldap 2>/dev/null; docker compose rm -f ldap 2>/dev/null; docker compose up -d ldap", shell=True, timeout=90, cwd=os.path.expanduser("~/authentik"))
+subprocess.run("docker compose stop ldap 2>/dev/null; docker compose rm -f ldap 2>/dev/null; docker compose up -d ldap", shell=True, timeout=90, cwd=_find_module_dir('authentik'))
 print("OK")
 '''
 
@@ -20135,7 +20152,7 @@ def authentik_fix_ldap_token():
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
     # Local: same logic as deploy token injection
-    ak_dir = os.path.expanduser('~/authentik')
+    ak_dir = _find_module_dir('authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     if not os.path.isfile(compose_path):
         return jsonify({'success': False, 'error': 'docker-compose.yml not found'}), 400
@@ -20211,7 +20228,7 @@ def authentik_uninstall():
         subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
         steps.append('Updated Caddyfile')
     else:
-        ak_dir = os.path.expanduser('~/authentik')
+        ak_dir = _find_module_dir('authentik')
         if os.path.exists(ak_dir):
             r = subprocess.run(f'cd {ak_dir} && docker compose down -v --rmi all --remove-orphans 2>&1', shell=True, capture_output=True, text=True, timeout=180)
             steps.append('Stopped and removed Docker containers/volumes/images')
@@ -20889,7 +20906,7 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
 
 def _find_authentik_install_dir():
     """Return (ak_dir, env_path, compose_path) if found, else (None, None, None). Tries ~/authentik, /opt/authentik, then docker compose project dir."""
-    for candidate in [os.path.expanduser('~/authentik'), '/opt/authentik']:
+    for candidate in [_find_module_dir('authentik'), '/opt/authentik']:
         if not candidate:
             continue
         env_path = os.path.join(candidate, '.env')
@@ -21364,7 +21381,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
     + heavy load + healthy FQDN target available" qualifies — the alternative is waiting for
     the user to hit the spiral and lose webadmin access.
     """
-    ak_dir = os.path.expanduser('~/authentik')
+    ak_dir = _find_module_dir('authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     env_path = os.path.join(ak_dir, '.env')
     if not os.path.exists(compose_path) or not os.path.exists(env_path):
@@ -21515,7 +21532,7 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
 
     Idempotent. Skip-on-precondition: ~/authentik missing, env already has the var, etc.
     """
-    ak_dir = os.path.expanduser('~/authentik')
+    ak_dir = _find_module_dir('authentik')
     env_path = os.path.join(ak_dir, '.env')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     if not os.path.exists(env_path) or not os.path.exists(compose_path):
@@ -21589,7 +21606,7 @@ def _recreate_authentik_server_worker(plog, reason):
         reason: short tag identifying the trigger (e.g. 'official-tunings-applied').
     Returns: True on success, False otherwise.
     """
-    ak_dir = os.path.expanduser('~/authentik')
+    ak_dir = _find_module_dir('authentik')
     if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
         plog("  authentik recreate: ~/authentik not installed, skipping")
         return False
@@ -21660,7 +21677,7 @@ def _authentik_apply_official_tunings(plog):
 
     Returns True if .env was modified (caller should restart), False if no-op.
     """
-    ak_dir = os.path.expanduser('~/authentik')
+    ak_dir = _find_module_dir('authentik')
     env_path = os.path.join(ak_dir, '.env')
     if not os.path.exists(env_path):
         plog("  authentik tunings: ~/authentik/.env not found — skipping (Authentik not installed)")
@@ -22054,7 +22071,7 @@ def _authentik_fix_pg_idle_timeout(plog):
     Idempotent: returns False on already-300s boxes (every startup after first).
     Returns True if the bump was applied.
     """
-    ak_dir = os.path.expanduser('~/authentik')
+    ak_dir = _find_module_dir('authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     if not os.path.exists(compose_path):
         plog("  pg idle timeout: ~/authentik/docker-compose.yml not found — skipping (Authentik not installed)")
@@ -22218,7 +22235,7 @@ def _authentik_spiral_monitor():
     while True:
         try:
             _t.sleep(600)
-            ak_dir = os.path.expanduser('~/authentik')
+            ak_dir = _find_module_dir('authentik')
             if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
                 continue
 
@@ -22258,7 +22275,7 @@ def run_authentik_deploy(reconfigure=False):
         authentik_deploy_log.append(entry)
         print(entry, flush=True)
     try:
-        ak_dir = os.path.expanduser('~/authentik')
+        ak_dir = _find_module_dir('authentik')
         settings = load_settings()
         server_ip = settings.get('server_ip', 'localhost')
         env_path = os.path.join(ak_dir, '.env')
@@ -24789,7 +24806,7 @@ def _ensure_ldap_flow_authentication_none():
     ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
     is_remote = ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip()
     if not is_remote:
-        ak_dir = os.path.expanduser('~/authentik')
+        ak_dir = _find_module_dir('authentik')
         if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
             return False, 'Authentik not deployed'
     url = _get_authentik_api_url(settings)
@@ -25294,7 +25311,7 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
             ok_ldap, _ = _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
             if not ok_ldap:
                 return False, 'Password set in Authentik but LDAP outpost restart failed on remote host. SSH to the Authentik server and run: cd ~/authentik && docker compose up -d --force-recreate ldap'
-        elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+        elif os.path.exists(os.path.join(_find_module_dir('authentik'), 'docker-compose.yml')):
             r = subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
                 shell=True, capture_output=True, text=True, timeout=90)
             if r.returncode != 0:
@@ -25361,7 +25378,7 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
                     pass
             if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
                 _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
-            elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+            elif os.path.exists(os.path.join(_find_module_dir('authentik'), 'docker-compose.yml')):
                 subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
                     shell=True, capture_output=True, text=True, timeout=90)
             ready2, ready_status2 = _wait_ldap_outpost_ready(timeout_secs=180)
@@ -25534,7 +25551,7 @@ def takserver_connect_ldap():
         elif not ok_bp:
             diag.append('Blueprint fix on remote: skip or failed (flow fix via API will still run)')
     else:
-        bp_path = os.path.expanduser('~/authentik/blueprints/tak-ldap-setup.yaml')
+        bp_path = os.path.join(_find_module_dir('authentik'), 'blueprints/tak-ldap-setup.yaml')
         if os.path.exists(bp_path):
             try:
                 with open(bp_path, 'r') as f:
@@ -28737,6 +28754,14 @@ def download_truststore():
     return jsonify({'error': 'truststore not found'}), 404
 
 
+
+@app.route('/api/caddy/download-root-ca')
+def download_caddy_root_ca():
+    path = '/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt'
+    if os.path.exists(path):
+        return send_from_directory(os.path.dirname(path), os.path.basename(path), as_attachment=True, download_name='infratak-ca.crt')
+    return jsonify({'error': 'Root CA not found on server'}), 404
+
 @app.route('/api/download/ca-pem')
 @login_required
 def download_ca_pem():
@@ -29137,7 +29162,7 @@ def run_full_uninstall():
 
         # 2. TAK Portal
         plog("━━━ TAK Portal ━━━")
-        portal_dir = os.path.expanduser('~/TAK-Portal')
+        portal_dir = _find_module_dir('TAK-Portal')
         if os.path.exists(portal_dir):
             subprocess.run(f'cd {portal_dir} && docker compose down -v --rmi local 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
             subprocess.run(f'rm -rf {portal_dir}', shell=True, capture_output=True)
@@ -29147,7 +29172,7 @@ def run_full_uninstall():
 
         # 3. CloudTAK
         plog("━━━ CloudTAK ━━━")
-        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+        cloudtak_dir = _find_module_dir('CloudTAK')
         for yml in [os.path.join(cloudtak_dir, 'docker-compose.yml'), os.path.join(cloudtak_dir, 'compose.yaml')]:
             if os.path.exists(yml):
                 subprocess.run(f'docker compose -f "{yml}" down -v --rmi local 2>/dev/null; true', shell=True, capture_output=True, timeout=180, cwd=cloudtak_dir)
@@ -29160,7 +29185,7 @@ def run_full_uninstall():
 
         # 4. Node-RED
         plog("━━━ Node-RED ━━━")
-        nr_dir = os.path.expanduser('~/node-red')
+        nr_dir = _find_module_dir('node-red')
         compose = os.path.join(nr_dir, 'docker-compose.yml')
         if os.path.exists(compose):
             subprocess.run(f'docker compose -f "{compose}" down -v 2>/dev/null; true', shell=True, capture_output=True, timeout=60, cwd=nr_dir)
@@ -29209,7 +29234,7 @@ def run_full_uninstall():
 
         # 7. Authentik
         plog("━━━ Authentik ━━━")
-        ak_dir = os.path.expanduser('~/authentik')
+        ak_dir = _find_module_dir('authentik')
         if os.path.exists(ak_dir):
             subprocess.run(f'cd {ak_dir} && docker compose down -v --rmi all --remove-orphans 2>/dev/null; true', shell=True, capture_output=True, text=True, timeout=180)
             subprocess.run(f'rm -rf {ak_dir}', shell=True, capture_output=True)
@@ -30641,7 +30666,7 @@ def _startup_migrations():
         # AUTHENTIK_WEB_WORKERS=4 (single underscore — silently ignored by Authentik 2026.x)
         # to AUTHENTIK_WEB__WORKERS=4 (correct double-underscore name).
         try:
-            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+            if os.path.exists(os.path.join(_find_module_dir('authentik'), '.env')):
                 changed = _authentik_apply_official_tunings(lambda m: print(f"Startup migration: {m}", flush=True))
                 if changed:
                     print("Startup migration: authentik .env updated — recreating server+worker to apply", flush=True)
@@ -30769,7 +30794,7 @@ def _post_update_auto_deploy():
             # evidence of TLS failure. Look at a wide log window (--tail=400) so we don't miss the
             # original error after the outpost has been running for a while.
             try:
-                ak_compose = os.path.expanduser('~/authentik/docker-compose.yml')
+                ak_compose = os.path.exists(os.path.join(_find_module_dir('authentik'), 'docker-compose.yml'))
                 if os.path.exists(ak_compose):
                     with open(ak_compose) as _f:
                         _comp = _f.read()
@@ -30820,7 +30845,7 @@ def _post_update_auto_deploy():
             # validated, with automatic rollback. Runs after the proactive pass so a
             # successful proactive migration short-circuits this. No-ops on healthy boxes.
             try:
-                _ak_dir_v084 = os.path.expanduser('~/authentik')
+                _ak_dir_v084 = _find_module_dir('authentik')
                 if os.path.exists(os.path.join(_ak_dir_v084, 'docker-compose.yml')):
                     _apply_authentik_ldap_routing_repair(_ak_dir_v084, lambda m: print(f"Post-update: {m}"))
             except Exception as _e:
@@ -30833,7 +30858,7 @@ def _post_update_auto_deploy():
             # on tak-10 confirmed: 2 actual gunicorn workers despite "=4" in .env.
             # _authentik_apply_official_tunings handles the rename + applies cache/log tunings.
             try:
-                if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                if os.path.exists(os.path.join(_find_module_dir('authentik'), '.env')):
                     changed = _authentik_apply_official_tunings(lambda m: print(f"Post-update: {m}", flush=True))
                     if changed:
                         _recreate_authentik_server_worker(
@@ -30850,7 +30875,7 @@ def _post_update_auto_deploy():
             # On a stuck crash-looping box this also unsticks the box by force-recreating
             # Postgres (kills stale advisory locks) and restarting server+worker.
             try:
-                if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                if os.path.exists(os.path.join(_find_module_dir('authentik'), 'docker-compose.yml')):
                     _pg_changed = _authentik_fix_pg_idle_timeout(lambda m: print(f"Post-update: {m}", flush=True))
                     if _pg_changed:
                         # Re-run the verifier so the post-migration 300s value lands in the
@@ -30863,7 +30888,7 @@ def _post_update_auto_deploy():
             # bindings that still have evaluate_on_plan=true (boxes deployed before v0.8.8).
             # If fixes were applied, restarts authentik-server-1 only (LDAP outpost untouched).
             try:
-                if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                if os.path.exists(os.path.join(_find_module_dir('authentik'), 'docker-compose.yml')):
                     _authentik_fix_ldap_flow_recursion(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _e:
                 print(f"Post-update: ldap flow recursion fix skipped: {_e}")
@@ -30886,7 +30911,7 @@ def _post_update_auto_deploy():
 
             # Run Authentik, TAK Portal, CloudTAK in parallel (they're independent)
             def _auto_authentik():
-                ak_dir = os.path.expanduser('~/authentik')
+                ak_dir = _find_module_dir('authentik')
                 if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')) and _authentik_installed_for_reconfigure():
                     if not authentik_deploy_status.get('running'):
                         print("Post-update: auto-reconfiguring Authentik")
@@ -30902,7 +30927,7 @@ def _post_update_auto_deploy():
                         print("Post-update: Authentik deploy already running, skipped")
 
             def _auto_takportal():
-                portal_dir = os.path.expanduser('~/TAK-Portal')
+                portal_dir = _find_module_dir('TAK-Portal')
                 if os.path.exists(portal_dir):
                     try:
                         r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"',
@@ -30943,7 +30968,7 @@ def _post_update_auto_deploy():
                 try:
                     settings = load_settings()
                     ct_cfg = _get_cloudtak_deployment_config(settings)
-                    ct_dir = os.path.expanduser('~/CloudTAK')
+                    ct_dir = _find_module_dir('CloudTAK')
                     if ct_cfg.get('target_mode') == 'remote' and ct_cfg.get('deployed'):
                         remote_cfg = ct_cfg.get('remote', {})
                         remote_host = (remote_cfg.get('host') or '').strip()
@@ -30978,7 +31003,7 @@ def _post_update_auto_deploy():
                     _auto_deploy_active.pop('cloudtak', None)
 
             def _auto_nodered():
-                nr_dir = os.path.expanduser('~/node-red')
+                nr_dir = _find_module_dir('node-red')
                 compose_path = os.path.join(nr_dir, 'docker-compose.yml')
                 if os.path.exists(compose_path):
                     try:
@@ -31217,7 +31242,7 @@ def _post_update_auto_deploy():
                     print(f"Post-update: Node-RED malware scan error: {e}")
 
             def _auto_authentik_ports():
-                ak_dir = os.path.expanduser('~/authentik')
+                ak_dir = _find_module_dir('authentik')
                 compose_path = os.path.join(ak_dir, 'docker-compose.yml')
                 if os.path.exists(compose_path):
                     try:
@@ -31281,7 +31306,7 @@ def _post_update_auto_deploy():
 
             # Authentik must be healthy before TAK Portal reconfigures (Portal calls Authentik API)
             _auto_authentik()
-            ak_dir = os.path.expanduser('~/authentik')
+            ak_dir = _find_module_dir('authentik')
             if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
                 for _i in range(60):
                     r = subprocess.run('docker ps --filter name=authentik-server --format "{{.Status}}" 2>/dev/null',
@@ -31467,7 +31492,7 @@ def frigate_deploy():
 @app.route('/api/frigate/remove', methods=['POST'])
 @login_required
 def frigate_remove():
-    frigate_dir = os.path.expanduser('~/frigate')
+    frigate_dir = _find_module_dir('frigate')
     subprocess.run(f'cd {frigate_dir} && docker compose down', shell=True, capture_output=True)
     if os.path.exists(os.path.join(frigate_dir, 'docker-compose.yml')):
         os.remove(os.path.join(frigate_dir, 'docker-compose.yml'))
@@ -31487,7 +31512,7 @@ def run_frigate_deploy():
         frigate_deploy_log.append(entry)
         print(entry, flush=True)
     try:
-        frigate_dir = os.path.expanduser('~/frigate')
+        frigate_dir = _find_module_dir('frigate')
         os.makedirs(frigate_dir, exist_ok=True)
         compose_content = """
 services:
@@ -31644,7 +31669,7 @@ def n8n_deploy():
 @app.route('/api/n8n/remove', methods=['POST'])
 @login_required
 def n8n_remove():
-    n8n_dir = os.path.expanduser('~/n8n-tactical')
+    n8n_dir = '/home/sauron/n8n-tactical'
     subprocess.run(f'cd {n8n_dir} && docker compose down', shell=True, capture_output=True)
     # Note: We don't delete docker-compose.yml here to allow re-deploy to see it's "not installed" properly 
     # but we remove the marker for detect_modules
@@ -31666,7 +31691,7 @@ def run_n8n_deploy():
         n8n_deploy_log.append(entry)
         print(entry, flush=True)
     try:
-        n8n_dir = os.path.expanduser('~/n8n-tactical')
+        n8n_dir = '/home/sauron/n8n-tactical'
         os.makedirs(n8n_dir, exist_ok=True)
         os.makedirs(os.path.join(n8n_dir, 'data'), exist_ok=True)
         # Fix permissions
